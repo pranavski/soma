@@ -18,13 +18,33 @@ struct HealthDaysRepository {
     func fetchRecent(days: Int = 28) async throws -> [HealthDay] {
         let response = try await client
             .from("health_days")
-            .select("day,steps,sleep_minutes,resting_hr_bpm,hrv_ms,tier")
+            .select(Self.columns)
             .order("day", ascending: false)
             .limit(days)
             .execute()
 
         return try decoder.decode([HealthDay].self, from: response.data)
     }
+
+    /// The owner's rows for the trailing window, oldest first — the shape
+    /// the Insights charts want (RLS scopes the query to the caller).
+    func fetchLastDays(_ days: Int) async throws -> [HealthDay] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let cutoff = calendar.date(byAdding: .day, value: -days, to: today) ?? today
+
+        let response = try await client
+            .from("health_days")
+            .select(Self.columns)
+            .gte("day", value: SupabaseDates.localDay(cutoff))
+            .order("day", ascending: true)
+            .execute()
+
+        return try decoder.decode([HealthDay].self, from: response.data)
+    }
+
+    private static let columns =
+        "day,steps,sleep_minutes,resting_hr_bpm,hrv_ms,weight_kg,active_energy_kcal,workout_minutes,tier"
 
     /// Insert-or-update a batch of daily aggregates. Called by
     /// `HealthKitAggregator` after it computes the rollup on-device.
@@ -39,6 +59,9 @@ struct HealthDaysRepository {
             let sleep_minutes: Int?
             let resting_hr_bpm: Double?
             let hrv_ms: Double?
+            let weight_kg: Double?
+            let active_energy_kcal: Int?
+            let workout_minutes: Int?
             let tier: Int
             let synced_at: String
         }
@@ -52,6 +75,9 @@ struct HealthDaysRepository {
                 sleep_minutes: $0.sleepMinutes,
                 resting_hr_bpm: $0.restingHrBpm,
                 hrv_ms: $0.hrvMs,
+                weight_kg: $0.weightKg,
+                active_energy_kcal: $0.activeEnergyKcal,
+                workout_minutes: $0.workoutMinutes,
                 tier: $0.tier,
                 synced_at: now
             )

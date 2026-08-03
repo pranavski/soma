@@ -1,8 +1,9 @@
 import Foundation
 import Supabase
 
-/// Read-only access to `public.insights` for the client. Writes come from
-/// the `generate-insights` Edge Function via the service role.
+/// Read access to `public.insights` plus the on-demand generation trigger.
+/// Rows are written only by the `generate-insights` Edge Function; the
+/// client never inserts insights directly.
 struct InsightsRepository {
     private let client: SupabaseClient
     private let decoder: JSONDecoder
@@ -12,29 +13,26 @@ struct InsightsRepository {
         self.decoder = SupabaseDates.makeDecoder()
     }
 
-    /// The most recent insight, if any. Nil is the intended "no-insights-yet"
-    /// state — the copy contract says silence beats a hallucinated finding.
-    func fetchLatest() async throws -> Insight? {
+    /// Recent history, most recent first. Empty is the intended
+    /// "no-insights-yet" state — silence beats a hallucinated finding.
+    func fetchRecent(limit: Int = 20) async throws -> [Insight] {
         let response = try await client
             .from("insights")
-            .select("id,week_start,rule_id,tier,lookback_days,copy")
-            .order("week_start", ascending: false)
-            .limit(1)
-            .execute()
-
-        return try decoder.decode([Insight].self, from: response.data).first
-    }
-
-    /// Recent history, most recent first. Insights view uses this to
-    /// render a small "prior weeks" strip once the user has more than one.
-    func fetchRecent(limit: Int = 8) async throws -> [Insight] {
-        let response = try await client
-            .from("insights")
-            .select("id,week_start,rule_id,tier,lookback_days,copy")
-            .order("week_start", ascending: false)
+            .select("id,created_at,claim,evidence,confidence,suggested_action,window_days")
+            .order("created_at", ascending: false)
             .limit(limit)
             .execute()
 
         return try decoder.decode([Insight].self, from: response.data)
+    }
+
+    /// Ask the Edge Function to generate insights for the caller now.
+    /// The function reads the user from the JWT; the body is intentionally
+    /// empty. New rows land in `insights` — refetch to see them.
+    func requestGeneration() async throws {
+        try await client.functions.invoke(
+            "generate-insights",
+            options: FunctionInvokeOptions(body: [String: String]())
+        )
     }
 }

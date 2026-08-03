@@ -1,29 +1,34 @@
 import Foundation
 
-/// One weekly finding — matches `public.insights`.
-/// Rule ids are pinned to the four v1 rules in the `insight-rules` skill.
+/// One generated finding — matches the new `public.insights` shape produced
+/// on demand by the `generate-insights` Edge Function.
 struct Insight: Identifiable, Hashable, Codable {
-    let id: UUID
-    let weekStart: Date
-    let ruleId: RuleId
-    let tier: Int
-    let lookbackDays: Int
-    let copy: String
+    enum Confidence: String, Codable, CaseIterable, Comparable {
+        case low, medium, high
 
-    enum RuleId: String, Codable, Hashable {
-        case lateEatEnergy      = "late_eat_energy"
-        case repeatDishEnergy   = "repeat_dish_energy"
-        case stepsSleep         = "steps_sleep"
-        case lateEatOvernight   = "late_eat_overnight"
+        static func < (lhs: Confidence, rhs: Confidence) -> Bool {
+            guard let l = allCases.firstIndex(of: lhs),
+                  let r = allCases.firstIndex(of: rhs) else { return false }
+            return l < r
+        }
     }
+
+    let id: UUID
+    let createdAt: Date
+    let claim: String
+    let evidence: String
+    let confidence: Confidence
+    let suggestedAction: String?
+    let windowDays: Int
 
     enum CodingKeys: String, CodingKey {
         case id
-        case weekStart    = "week_start"
-        case ruleId       = "rule_id"
-        case tier
-        case lookbackDays = "lookback_days"
-        case copy
+        case createdAt       = "created_at"
+        case claim
+        case evidence
+        case confidence
+        case suggestedAction = "suggested_action"
+        case windowDays      = "window_days"
     }
 
     /// The persimmon caption under the finding — invariant copy that

@@ -1,7 +1,9 @@
 import SwiftUI
 
 enum SomaTab: String, CaseIterable, Hashable {
-    case today, history, insights, settings
+    // Declaration order IS presentation order (CaseIterable drives the tab
+    // bar). Insights lead — the app is an insight engine first.
+    case insights, today, history, settings
 
     var label: String {
         switch self {
@@ -22,7 +24,7 @@ struct RootView: View {
             return parsed
         }
         #endif
-        return .today
+        return .insights
     }()
 
     var body: some View {
@@ -64,9 +66,12 @@ struct RootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
+            // Only the bar itself ignores the keyboard — the tab content
+            // must keep respecting it so the insights quick-log field can
+            // ride up above the keyboard instead of hiding under it.
             SomaTabBar(selected: $tab)
+                .ignoresSafeArea(.keyboard, edges: .bottom)
         }
-        .ignoresSafeArea(.keyboard, edges: .bottom)
         // Fresh identity per user id — signing out then in as a different
         // account discards every child @StateObject (TodayViewModel etc.)
         // instead of letting them re-emit the previous user's cached rows.

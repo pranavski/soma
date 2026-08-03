@@ -5,7 +5,8 @@ import HealthKit
 /// day, and hands them back so `HealthDaysRepository` can upsert the rollup.
 ///
 /// **Raw HealthKit reads never leave the device.** Only the per-day
-/// `HealthDay` values (steps, sleep_minutes, resting_hr_bpm, hrv_ms) sync.
+/// `HealthDay` values (steps, sleep_minutes, resting_hr_bpm, hrv_ms,
+/// weight_kg, active_energy_kcal, workout_minutes) sync.
 @MainActor
 final class HealthKitAggregator {
     static let shared = HealthKitAggregator()
@@ -28,6 +29,9 @@ final class HealthKitAggregator {
         if let rhr   = HKObjectType.quantityType(forIdentifier: .restingHeartRate) { types.insert(rhr) }
         if let hrv   = HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN) { types.insert(hrv) }
         if let sleep = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.insert(sleep) }
+        if let mass  = HKObjectType.quantityType(forIdentifier: .bodyMass) { types.insert(mass) }
+        if let energy = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned) { types.insert(energy) }
+        types.insert(HKObjectType.workoutType())
         return types
     }
 
@@ -56,7 +60,9 @@ final class HealthKitAggregator {
         let anchor = calendar.startOfDay(for: Date())
         guard let start = calendar.date(byAdding: .day, value: -(days - 1), to: anchor) else { return [] }
 
-        async let steps = stepsByDay(store: store, start: start, end: anchor, calendar: calendar)
+        async let steps = sumQuantityByDay(store: store, identifier: .stepCount,
+                                           unit: .count(),
+                                           start: start, end: anchor, calendar: calendar)
         async let rhr   = averageQuantityByDay(store: store, identifier: .restingHeartRate,
                                                unit: HKUnit.count().unitDivided(by: .minute()),
                                                start: start, end: anchor, calendar: calendar)
@@ -64,11 +70,21 @@ final class HealthKitAggregator {
                                                unit: HKUnit.secondUnit(with: .milli),
                                                start: start, end: anchor, calendar: calendar)
         async let sleep = sleepMinutesByStartDay(store: store, start: start, end: anchor, calendar: calendar)
+        async let weight = averageQuantityByDay(store: store, identifier: .bodyMass,
+                                                unit: .gramUnit(with: .kilo),
+                                                start: start, end: anchor, calendar: calendar)
+        async let energy = sumQuantityByDay(store: store, identifier: .activeEnergyBurned,
+                                            unit: .kilocalorie(),
+                                            start: start, end: anchor, calendar: calendar)
+        async let workouts = workoutMinutesByStartDay(store: store, start: start, end: anchor, calendar: calendar)
 
-        let stepMap  = try await steps
-        let rhrMap   = try await rhr
-        let hrvMap   = try await hrv
-        let sleepMap = try await sleep
+        let stepMap    = try await steps
+        let rhrMap     = try await rhr
+        let hrvMap     = try await hrv
+        let sleepMap   = try await sleep
+        let weightMap  = try await weight
+        let energyMap  = try await energy
+        let workoutMap = try await workouts
 
         var out: [HealthDay] = []
         var day = start
@@ -78,15 +94,21 @@ final class HealthKitAggregator {
             let sm  = sleepMap[key]
             let r   = rhrMap[key]
             let h   = hrvMap[key]
+            let w   = weightMap[key]
+            let e   = energyMap[key]
+            let wm  = workoutMap[key]
             // Skip days with literally nothing — we don't want to overwrite
-            // a real earlier row with (nil, nil, nil, nil) and drop its tier.
-            if s != nil || sm != nil || r != nil || h != nil {
+            // a real earlier row with all-nil values and drop its tier.
+            if s != nil || sm != nil || r != nil || h != nil || w != nil || e != nil || wm != nil {
                 out.append(HealthDay(
                     day: key,
                     steps: s,
                     sleepMinutes: sm,
                     restingHrBpm: r,
                     hrvMs: h,
+                    weightKg: w,
+                    activeEnergyKcal: e,
+                    workoutMinutes: wm,
                     tier: HealthDay.tier(steps: s, sleep: sm, rhr: r, hrv: h)
                 ))
             }
@@ -98,11 +120,13 @@ final class HealthKitAggregator {
 
     // MARK: - Query helpers
 
-    private func stepsByDay(
+    private func sumQuantityByDay(
         store: HKHealthStore,
+        identifier: HKQuantityTypeIdentifier,
+        unit: HKUnit,
         start: Date, end: Date, calendar: Calendar
     ) async throws -> [Date: Int] {
-        guard let type = HKObjectType.quantityType(forIdentifier: .stepCount) else { return [:] }
+        guard let type = HKObjectType.quantityType(forIdentifier: identifier) else { return [:] }
         let interval = DateComponents(day: 1)
         let anchor = calendar.startOfDay(for: start)
         let predicate = HKQuery.predicateForSamples(withStart: start, end: calendar.date(byAdding: .day, value: 1, to: end) ?? end, options: .strictStartDate)
@@ -117,7 +141,7 @@ final class HealthKitAggregator {
         collection.enumerateStatistics(from: start, to: end) { stats, _ in
             if let sum = stats.sumQuantity() {
                 let day = calendar.startOfDay(for: stats.startDate)
-                out[day] = Int(sum.doubleValue(for: .count()))
+                out[day] = Int(sum.doubleValue(for: unit))
             }
         }
         return out
@@ -176,6 +200,35 @@ final class HealthKitAggregator {
             guard Self.isAsleep(sample: s) else { continue }
             let day = calendar.startOfDay(for: s.startDate)
             let minutes = Int(s.endDate.timeIntervalSince(s.startDate) / 60.0)
+            if minutes > 0 {
+                minutesByStartDay[day, default: 0] += minutes
+            }
+        }
+        return minutesByStartDay
+    }
+
+    /// Workouts are attributed to the local day they *started* — a session
+    /// that crosses midnight counts entirely toward its start day, matching
+    /// how the sleep rollup handles boundary-crossing samples.
+    private func workoutMinutesByStartDay(
+        store: HKHealthStore,
+        start: Date, end: Date, calendar: Calendar
+    ) async throws -> [Date: Int] {
+        let predicate = HKQuery.predicateForSamples(
+            withStart: start,
+            end: calendar.date(byAdding: .day, value: 1, to: end) ?? end,
+            options: .strictStartDate
+        )
+        let descriptor = HKSampleQueryDescriptor(
+            predicates: [.workout(predicate)],
+            sortDescriptors: [SortDescriptor(\.startDate, order: .forward)]
+        )
+        let workouts = try await descriptor.result(for: store)
+
+        var minutesByStartDay: [Date: Int] = [:]
+        for workout in workouts {
+            let day = calendar.startOfDay(for: workout.startDate)
+            let minutes = Int(workout.duration / 60.0)
             if minutes > 0 {
                 minutesByStartDay[day, default: 0] += minutes
             }

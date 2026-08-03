@@ -9,14 +9,20 @@ struct HealthDay: Hashable, Codable {
     let sleepMinutes: Int?
     let restingHrBpm: Double?
     let hrvMs: Double?
+    let weightKg: Double?
+    let activeEnergyKcal: Int?
+    let workoutMinutes: Int?
     let tier: Int
 
     enum CodingKeys: String, CodingKey {
         case day
         case steps
-        case sleepMinutes = "sleep_minutes"
-        case restingHrBpm = "resting_hr_bpm"
-        case hrvMs        = "hrv_ms"
+        case sleepMinutes     = "sleep_minutes"
+        case restingHrBpm     = "resting_hr_bpm"
+        case hrvMs            = "hrv_ms"
+        case weightKg         = "weight_kg"
+        case activeEnergyKcal = "active_energy_kcal"
+        case workoutMinutes   = "workout_minutes"
         case tier
     }
 

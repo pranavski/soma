@@ -1,55 +1,48 @@
 // generate-insights
 //
-// Weekly job (per user): computes the four rules in insight-rules,
-// picks at most one finding, asks Claude to write the hedged copy,
-// inserts a row into `insights`. Skips silently if nothing qualifies.
+// The insight engine. Compresses the caller's last 30 days of food logs,
+// energy check-ins, and HealthKit daily aggregates into a per-day digest,
+// hands it to Claude ONCE, and stores the returned correlations as
+// individual insight rows. TypeScript compresses; Claude reasons.
 //
-// Invocation:
-//   - Scheduled (cron) with a shared secret in the Authorization header.
-//   - Body: { user_id: uuid, week_start: 'YYYY-MM-DD' }
-//   - For batch runs the SQL scheduler POSTs once per active user.
+// Invocation — two auth paths:
+//   1. Cron/batch: Authorization matches INSIGHTS_CRON_SECRET,
+//      body { user_id: uuid }. (Legacy week_start is ignored.)
+//   2. On-demand: Authorization is a user JWT, body {} — generates for
+//      the caller. This is what the iOS pull-to-refresh hits.
+//
+// Response:
+//   200 { surfaced: boolean, inserted: number }            — ran
+//   200 { surfaced: false, reason: "insufficient_data" }   — gated, no Claude call
+//   500 { error: "bad_model_output" }                      — model broke contract
+//
+// Dedupe is two-layered: the prompt carries the user's recent claims as
+// "do not repeat", and unique (user_id, claim_norm) in Postgres backstops
+// it — re-runs are inserts that silently no-op on conflict.
 //
 // Secrets required:
 //   ANTHROPIC_API_KEY
-//   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY  (auto-injected)
-//   INSIGHTS_CRON_SECRET                     (set via `supabase secrets set`)
+//   INSIGHTS_CRON_SECRET                       (set via `supabase secrets set`)
+//   SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY (auto-injected)
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import {
+  type CheckinRow,
+  type HealthDayRow,
+  type MealRow,
+  MAX_INSIGHTS,
+  buildDigest,
+  coverageSummary,
+  extractJson,
+  hasSufficientData,
+  normalizeClaim,
+  validateInsights,
+} from "./digest.ts";
 
 const ANTHROPIC_MODEL = "claude-sonnet-4-6";
-const LOOKBACK_DAYS = 28;
-const LATE_HOUR = 21; // "after 21:00" per insight-rules
-
-type RuleId =
-  | "late_eat_energy"
-  | "repeat_dish_energy"
-  | "steps_sleep"
-  | "late_eat_overnight";
-
-type Tier = 0 | 1 | 2;
-
-type Finding = {
-  rule_id: RuleId;
-  tier: Tier;
-  stat: Record<string, unknown>;
-  effect: number; // normalized within-rule effect size, for ranking
-};
-
-type Meal = {
-  eaten_at: string;
-  eaten_date: string | null;
-  eaten_hour: number | null;
-  dish_name: string | null;
-};
-type Checkin = { check_date: string; energy: number };
-type HealthDay = {
-  day: string;
-  steps: number | null;
-  sleep_minutes: number | null;
-  resting_hr_bpm: number | null;
-  hrv_ms: number | null;
-};
+const WINDOW_DAYS = 30;
+const RECENT_CLAIMS_LIMIT = 15;
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -58,324 +51,85 @@ function json(status: number, body: unknown): Response {
   });
 }
 
-// ─── Date helpers ───────────────────────────────────────────────────────────
+// ─── Data window ────────────────────────────────────────────────────────────
 
-// Local day/hour of the meal, as observed by the user. The client records
-// eaten_date/eaten_hour in its own timezone at log time — eaten_at is
-// timestamptz, which Postgres normalizes to UTC, so deriving locality from
-// it is wrong for any non-UTC user. The eaten_at fallback (UTC) only
-// applies to legacy rows written before the local columns existed.
-function dayOfMeal(m: Meal): string {
-  return m.eaten_date ?? m.eaten_at.slice(0, 10);
-}
+async function loadWindow(admin: SupabaseClient, userId: string) {
+  const start = new Date();
+  start.setUTCDate(start.getUTCDate() - WINDOW_DAYS);
+  const startISO = start.toISOString();
+  const startDay = startISO.slice(0, 10);
 
-function hourOfMeal(m: Meal): number {
-  if (m.eaten_hour !== null && m.eaten_hour !== undefined) return m.eaten_hour;
-  const match = m.eaten_at.match(/T(\d{2}):/);
-  return match ? Number(match[1]) : 0;
-}
-
-function nextDay(day: string): string {
-  const d = new Date(`${day}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + 1);
-  return d.toISOString().slice(0, 10);
-}
-
-function windowStartISO(weekStart: string, lookbackDays: number): string {
-  const d = new Date(`${weekStart}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() - lookbackDays);
-  return d.toISOString();
-}
-
-// ─── Data pulls (service role — RLS bypassed) ───────────────────────────────
-
-async function loadWindow(admin: SupabaseClient, userId: string, weekStart: string) {
-  const startISO = windowStartISO(weekStart, LOOKBACK_DAYS);
   const [meals, checkins, health] = await Promise.all([
     admin.from("meals")
-      .select("eaten_at,eaten_date,eaten_hour,dish_name")
+      .select("eaten_at,eaten_date,eaten_hour,dish_name,voice_transcript,calories_low,calories_high,protein_g_low,protein_g_high")
       .eq("user_id", userId)
       .gte("eaten_at", startISO)
-      .lt("eaten_at", `${weekStart}T23:59:59Z`)
       .order("eaten_at", { ascending: true }),
     admin.from("daily_checkins")
       .select("check_date,energy")
       .eq("user_id", userId)
-      .gte("check_date", startISO.slice(0, 10))
-      .lte("check_date", weekStart),
+      .gte("check_date", startDay),
     admin.from("health_days")
-      .select("day,steps,sleep_minutes,resting_hr_bpm,hrv_ms")
+      .select("day,steps,sleep_minutes,resting_hr_bpm,hrv_ms,weight_kg,active_energy_kcal,workout_minutes")
       .eq("user_id", userId)
-      .gte("day", startISO.slice(0, 10))
-      .lte("day", weekStart),
+      .gte("day", startDay),
   ]);
   return {
-    meals: (meals.data ?? []) as Meal[],
-    checkins: (checkins.data ?? []) as Checkin[],
-    health: (health.data ?? []) as HealthDay[],
+    meals: (meals.data ?? []) as MealRow[],
+    checkins: (checkins.data ?? []) as CheckinRow[],
+    health: (health.data ?? []) as HealthDayRow[],
   };
 }
 
-// ─── Tier detection ─────────────────────────────────────────────────────────
+// ─── Claude ─────────────────────────────────────────────────────────────────
 
-function detectTier(health: HealthDay[]): Tier {
-  if (health.length === 0) return 0;
-  const hasBasic = health.some(h => h.steps !== null && h.sleep_minutes !== null);
-  const hasCardio = health.some(h => h.resting_hr_bpm !== null || h.hrv_ms !== null);
-  if (hasBasic && hasCardio) return 2;
-  if (hasBasic) return 1;
-  return 0;
+// The copy contract carries the soul of the old insight-rules skill —
+// hedged, never prescriptive, never medical, calories only as ranges —
+// but the finding itself now comes from the model, so the prompt also has
+// to police evidence discipline: real numbers, real day counts, n >= 4.
+const SYSTEM_PROMPT = `You are the insight engine for a food–body journal. You receive a per-day digest of one person's last ~30 days (meals with rough calorie/protein ranges, a 1–5 energy self-report, and daily HealthKit aggregates) plus per-metric coverage counts.
+
+Find correlations and patterns in THIS person's data. Return ONLY a JSON array — no prose, no markdown, no code fences — of at most ${MAX_INSIGHTS} objects, each EXACTLY:
+{
+  "claim": string,
+  "evidence": string,
+  "confidence": "low" | "medium" | "high",
+  "suggested_action": string | null
 }
 
-// ─── Small stats ────────────────────────────────────────────────────────────
+Rules — non-negotiable:
+- claim: one sentence naming a specific pattern in the data with real numbers from the digest (e.g. "Energy dips to 2/5 tend to follow sub-20g-protein mornings — 5 of the 6 such days"). NEVER generic nutrition advice. Hedged language only: "tends to", "seems", "is associated with". Never "causes", "makes you", "you should".
+- evidence: the supporting observation spelled out — which days, how many, the compared values (e.g. "mean energy 2.2/5 after the 6 low-protein mornings vs 3.6/5 after the 9 higher-protein ones").
+- confidence: high only for a consistent pattern with n ≥ 8 supporting days; medium for n ≥ 6; low otherwise.
+- A pattern needs at least 4 supporting days to be claimed at all. Fewer than 4 → do not include it.
+- Respect the coverage counts: never claim a trend in a metric with fewer than 4 days of data. Never treat a missing metric on a day as zero — missing means not synced.
+- suggested_action: a single gentle, observational next step ("worth watching whether earlier dinners shift this"), or null. Never prescriptive ("eat less X"), never a target, never medical.
+- Calories only ever as ranges ("~550–700"), never a bare number.
+- You will be given claims already shown to this person. Do not repeat or rephrase any of them — only genuinely new patterns.
+- If nothing meets the bar, return []. An empty array is a good answer; an invented pattern is not.`;
 
-function mean(xs: number[]): number {
-  return xs.length === 0 ? NaN : xs.reduce((a, b) => a + b, 0) / xs.length;
+function buildUserMessage(
+  digestLines: string[],
+  coverage: string,
+  priorClaims: string[],
+): string {
+  const blocks: string[] = [
+    `Per-metric coverage over the window:\n${coverage}`,
+    `Daily digest (missing metrics = not synced, NOT zero):\n${digestLines.join("\n")}`,
+  ];
+  if (priorClaims.length > 0) {
+    blocks.push(
+      "Already surfaced — do not repeat or rephrase these:\n" +
+        priorClaims.map((c) => `- ${c}`).join("\n"),
+    );
+  }
+  blocks.push("Return the JSON array now.");
+  return blocks.join("\n\n");
 }
 
-// Spearman rank correlation. NaN if fewer than 3 pairs.
-function spearman(xs: number[], ys: number[]): number {
-  if (xs.length !== ys.length || xs.length < 3) return NaN;
-  const rank = (arr: number[]): number[] => {
-    const sorted = arr.map((v, i) => [v, i] as [number, number])
-      .sort((a, b) => a[0] - b[0]);
-    const ranks = new Array(arr.length).fill(0);
-    let i = 0;
-    while (i < sorted.length) {
-      let j = i;
-      while (j + 1 < sorted.length && sorted[j + 1][0] === sorted[i][0]) j++;
-      const avg = (i + j) / 2 + 1; // 1-based average rank
-      for (let k = i; k <= j; k++) ranks[sorted[k][1]] = avg;
-      i = j + 1;
-    }
-    return ranks;
-  };
-  const rx = rank(xs);
-  const ry = rank(ys);
-  const n = xs.length;
-  const mx = mean(rx);
-  const my = mean(ry);
-  let num = 0, dx = 0, dy = 0;
-  for (let i = 0; i < n; i++) {
-    num += (rx[i] - mx) * (ry[i] - my);
-    dx  += (rx[i] - mx) ** 2;
-    dy  += (ry[i] - my) ** 2;
-  }
-  const denom = Math.sqrt(dx * dy);
-  return denom === 0 ? NaN : num / denom;
-}
-
-// ─── Rule 1: late-evening eating × next-day energy ─────────────────────────
-// Tier 0 · min 5/5 · surface |Δ| ≥ 0.6
-function ruleLateEatEnergy(meals: Meal[], checkins: Checkin[]): Finding | null {
-  // Set of "late days" — days on which the user had at least one meal
-  // eaten after 21:00 local. The comparison is next-day energy.
-  const lateDays = new Set<string>();
-  const anyMealDays = new Set<string>();
-  for (const m of meals) {
-    const day = dayOfMeal(m);
-    anyMealDays.add(day);
-    if (hourOfMeal(m) >= LATE_HOUR) lateDays.add(day);
-  }
-  const energyByDay = new Map<string, number>();
-  for (const c of checkins) energyByDay.set(c.check_date, c.energy);
-
-  const lateNextEnergy: number[] = [];
-  const notLateNextEnergy: number[] = [];
-  for (const day of anyMealDays) {
-    const next = nextDay(day);
-    const e = energyByDay.get(next);
-    if (e === undefined) continue;
-    if (lateDays.has(day)) lateNextEnergy.push(e);
-    else notLateNextEnergy.push(e);
-  }
-
-  if (lateNextEnergy.length < 5 || notLateNextEnergy.length < 5) return null;
-  const mLate = mean(lateNextEnergy);
-  const mNot  = mean(notLateNextEnergy);
-  const delta = mLate - mNot;
-  if (Math.abs(delta) < 0.6) return null;
-
-  return {
-    rule_id: "late_eat_energy",
-    tier: 0,
-    stat: {
-      delta,
-      n_late: lateNextEnergy.length,
-      n_not_late: notLateNextEnergy.length,
-      mean_energy_after_late: mLate,
-      mean_energy_after_not_late: mNot,
-    },
-    effect: Math.abs(delta) / 5, // normalize to the 0–5 scale
-  };
-}
-
-// ─── Rule 2: repeat-dish × next-day energy ─────────────────────────────────
-// Tier 0 · dish eaten ≥ 3 · cohort ≥ 5 · surface |Δ| ≥ 0.7
-function ruleRepeatDishEnergy(meals: Meal[], checkins: Checkin[]): Finding | null {
-  const energyByDay = new Map<string, number>();
-  for (const c of checkins) energyByDay.set(c.check_date, c.energy);
-
-  const daysByDish = new Map<string, Set<string>>();
-  const allDishDays = new Set<string>();
-  for (const m of meals) {
-    if (!m.dish_name) continue;
-    const day = dayOfMeal(m);
-    allDishDays.add(day);
-    const name = m.dish_name.trim().toLowerCase();
-    if (!name) continue;
-    if (!daysByDish.has(name)) daysByDish.set(name, new Set());
-    daysByDish.get(name)!.add(day);
-  }
-
-  let best: Finding | null = null;
-
-  for (const [dish, days] of daysByDish) {
-    if (days.size < 3) continue;
-    const dishNextEnergy: number[] = [];
-    const cohortNextEnergy: number[] = [];
-    for (const day of allDishDays) {
-      const e = energyByDay.get(nextDay(day));
-      if (e === undefined) continue;
-      if (days.has(day)) dishNextEnergy.push(e);
-      else cohortNextEnergy.push(e);
-    }
-    if (dishNextEnergy.length < 3 || cohortNextEnergy.length < 5) continue;
-
-    const mDish = mean(dishNextEnergy);
-    const mCohort = mean(cohortNextEnergy);
-    const delta = mDish - mCohort;
-    if (Math.abs(delta) < 0.7) continue;
-
-    const effect = Math.abs(delta) / 5;
-    if (!best || effect > best.effect) {
-      best = {
-        rule_id: "repeat_dish_energy",
-        tier: 0,
-        stat: {
-          dish,
-          delta,
-          n_dish: dishNextEnergy.length,
-          n_cohort: cohortNextEnergy.length,
-          mean_energy_after_dish: mDish,
-          mean_energy_after_cohort: mCohort,
-        },
-        effect,
-      };
-    }
-  }
-  return best;
-}
-
-// ─── Rule 3: step count × sleep duration ──────────────────────────────────
-// Tier 1 · ≥ 10 paired days · surface |ρ| ≥ 0.35
-function ruleStepsSleep(health: HealthDay[]): Finding | null {
-  const pairs: [number, number][] = [];
-  for (const h of health) {
-    if (h.steps !== null && h.sleep_minutes !== null) {
-      pairs.push([h.steps, h.sleep_minutes]);
-    }
-  }
-  if (pairs.length < 10) return null;
-  const rho = spearman(pairs.map(p => p[0]), pairs.map(p => p[1]));
-  if (!Number.isFinite(rho) || Math.abs(rho) < 0.35) return null;
-  return {
-    rule_id: "steps_sleep",
-    tier: 1,
-    stat: {
-      rho,
-      n_pairs: pairs.length,
-    },
-    effect: Math.abs(rho), // already in [0,1]
-  };
-}
-
-// ─── Rule 4: late eating × overnight RHR / HRV ────────────────────────────
-// Tier 2 · 5/5 · surface RHR Δ ≥ 2 bpm OR HRV Δ ≥ 4 ms
-function ruleLateEatOvernight(meals: Meal[], health: HealthDay[]): Finding | null {
-  const lateDays = new Set<string>();
-  const anyMealDays = new Set<string>();
-  for (const m of meals) {
-    const day = dayOfMeal(m);
-    anyMealDays.add(day);
-    if (hourOfMeal(m) >= LATE_HOUR) lateDays.add(day);
-  }
-  const rhrByDay = new Map<string, number>();
-  const hrvByDay = new Map<string, number>();
-  for (const h of health) {
-    if (h.resting_hr_bpm !== null) rhrByDay.set(h.day, h.resting_hr_bpm);
-    if (h.hrv_ms !== null)         hrvByDay.set(h.day, h.hrv_ms);
-  }
-
-  const collect = (map: Map<string, number>) => {
-    const late: number[] = [];
-    const notLate: number[] = [];
-    for (const day of anyMealDays) {
-      const v = map.get(day);
-      if (v === undefined) continue;
-      if (lateDays.has(day)) late.push(v);
-      else notLate.push(v);
-    }
-    return { late, notLate };
-  };
-
-  const rhr = collect(rhrByDay);
-  const hrv = collect(hrvByDay);
-
-  const rhrOk = rhr.late.length >= 5 && rhr.notLate.length >= 5;
-  const hrvOk = hrv.late.length >= 5 && hrv.notLate.length >= 5;
-  if (!rhrOk && !hrvOk) return null;
-
-  const rhrDelta = rhrOk ? mean(rhr.late) - mean(rhr.notLate) : 0;
-  const hrvDelta = hrvOk ? mean(hrv.late) - mean(hrv.notLate) : 0;
-
-  const rhrSurface = rhrOk && Math.abs(rhrDelta) >= 2;
-  const hrvSurface = hrvOk && Math.abs(hrvDelta) >= 4;
-  if (!rhrSurface && !hrvSurface) return null;
-
-  // Effect: normalize each signal against its threshold and keep the max.
-  const effect = Math.max(
-    rhrSurface ? Math.abs(rhrDelta) / 10 : 0,
-    hrvSurface ? Math.abs(hrvDelta) / 20 : 0,
-  );
-
-  return {
-    rule_id: "late_eat_overnight",
-    tier: 2,
-    stat: {
-      rhr_delta: rhrDelta,
-      hrv_delta: hrvDelta,
-      n_late_rhr: rhr.late.length,
-      n_not_late_rhr: rhr.notLate.length,
-      n_late_hrv: hrv.late.length,
-      n_not_late_hrv: hrv.notLate.length,
-      surfaced: rhrSurface ? "rhr" : "hrv",
-    },
-    effect,
-  };
-}
-
-// ─── Claude copy ───────────────────────────────────────────────────────────
-
-async function generateCopy(finding: Finding): Promise<string | null> {
+async function callClaude(userMessage: string): Promise<string | null> {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
   if (!apiKey) return null;
-
-  const system = `You write ONE sentence for a weekly food-body insight.
-
-Contract — non-negotiable:
-- Exactly one sentence. ≤ 22 words.
-- Hedged: use "tends to", "seems", "is associated with", or "worth watching, not a verdict".
-- Never prescriptive. Never medical. Never "you should", "makes you", "causes".
-- Mention both sides of the comparison (e.g. "late dinners vs. earlier ones").
-- Never a bare calorie number — use a range or omit.
-- Return only the sentence. No preamble, no quotes, no markdown.`;
-
-  const user = `Rule: ${finding.rule_id}
-Computed stats (do not invent numbers): ${JSON.stringify(finding.stat)}
-
-Write the one sentence.`;
-
   let res: Response;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -387,9 +141,9 @@ Write the one sentence.`;
       },
       body: JSON.stringify({
         model: ANTHROPIC_MODEL,
-        max_tokens: 200,
-        system,
-        messages: [{ role: "user", content: user }],
+        max_tokens: 2000,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }],
       }),
     });
   } catch {
@@ -402,91 +156,107 @@ Write the one sentence.`;
   } catch {
     return null;
   }
-  const text = payload?.content?.find(b => b?.type === "text")?.text;
-  if (typeof text !== "string") return null;
-  const trimmed = text.trim().replace(/^["']|["']$/g, "").replace(/\s+/g, " ");
-  const words = trimmed.split(" ").length;
-  if (trimmed.length === 0 || words > 30) return null;
-  return trimmed;
+  const text = payload?.content?.find((b) => b?.type === "text")?.text;
+  return typeof text === "string" ? text : null;
 }
 
-// ─── Entrypoint ────────────────────────────────────────────────────────────
+// ─── Auth ───────────────────────────────────────────────────────────────────
+
+/// Resolve the target user from one of the two auth paths. Returns null
+/// when neither path authenticates.
+async function resolveUser(
+  req: Request,
+  body: { user_id?: string },
+  supabaseUrl: string,
+  anonKey: string,
+): Promise<string | null> {
+  const auth = req.headers.get("Authorization") ?? "";
+  if (!auth.startsWith("Bearer ")) return null;
+
+  const cronSecret = Deno.env.get("INSIGHTS_CRON_SECRET");
+  if (cronSecret && auth === `Bearer ${cronSecret}`) {
+    return body.user_id ?? null;
+  }
+
+  // User-JWT path: let Supabase verify the token.
+  const userClient = createClient(supabaseUrl, anonKey, {
+    global: { headers: { Authorization: auth } },
+  });
+  const { data, error } = await userClient.auth.getUser();
+  if (error || !data?.user?.id) return null;
+  return data.user.id;
+}
+
+// ─── Entrypoint ─────────────────────────────────────────────────────────────
 
 serve(async (req) => {
   if (req.method !== "POST") return json(405, { error: "method_not_allowed" });
 
-  const cronSecret = Deno.env.get("INSIGHTS_CRON_SECRET");
-  const auth = req.headers.get("Authorization") ?? "";
-  if (!cronSecret || auth !== `Bearer ${cronSecret}`) {
-    return json(401, { error: "unauthorized" });
+  let body: { user_id?: string } = {};
+  try {
+    const raw = await req.text();
+    if (raw.trim().length > 0) body = JSON.parse(raw);
+  } catch {
+    return json(400, { error: "invalid_json" });
   }
 
-  let body: { user_id?: string; week_start?: string };
-  try { body = await req.json(); }
-  catch { return json(400, { error: "invalid_json" }); }
-  if (!body.user_id || !body.week_start) {
-    return json(400, { error: "missing_user_id_or_week_start" });
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+  const userId = await resolveUser(req, body, supabaseUrl, anonKey);
+  if (!userId) return json(401, { error: "unauthorized" });
+
+  const admin = createClient(supabaseUrl, serviceKey);
+
+  const { meals, checkins, health } = await loadWindow(admin, userId);
+  const { lines, coverage } = buildDigest(meals, checkins, health);
+
+  if (!hasSufficientData(coverage)) {
+    return json(200, { surfaced: false, inserted: 0, reason: "insufficient_data" });
   }
 
-  const admin = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-  );
-
-  const { meals, checkins, health } = await loadWindow(admin, body.user_id, body.week_start);
-  const tier = detectTier(health);
-
-  // Compute every rule the user qualifies for.
-  const candidates: Finding[] = [];
-  const r1 = ruleLateEatEnergy(meals, checkins);
-  if (r1) candidates.push(r1);
-  const r2 = ruleRepeatDishEnergy(meals, checkins);
-  if (r2) candidates.push(r2);
-  if (tier >= 1) {
-    const r3 = ruleStepsSleep(health);
-    if (r3) candidates.push(r3);
-  }
-  if (tier >= 2) {
-    const r4 = ruleLateEatOvernight(meals, health);
-    if (r4) candidates.push(r4);
-  }
-
-  candidates.sort((a, b) => b.effect - a.effect);
-
-  // Never-repeat the most recent prior insight for this user.
   const { data: prior } = await admin
     .from("insights")
-    .select("rule_id")
-    .eq("user_id", body.user_id)
-    .order("week_start", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  const filtered = prior
-    ? candidates.filter(c => c.rule_id !== prior.rule_id)
-    : candidates;
+    .select("claim")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(RECENT_CLAIMS_LIMIT);
+  const priorClaims = (prior ?? []).map((r: { claim: string }) => r.claim);
 
-  if (filtered.length === 0) return json(200, { surfaced: false, tier });
-
-  const chosen = filtered[0];
-  const copy = await generateCopy(chosen);
-  if (!copy) return json(500, { error: "copy_generation_failed" });
-
-  // Idempotent per (user, week): a re-fired cron run is a graceful no-op
-  // rather than a unique-violation 500.
-  const { error: insErr } = await admin.from("insights").upsert(
-    {
-      user_id: body.user_id,
-      week_start: body.week_start,
-      rule_id: chosen.rule_id,
-      tier: chosen.tier,
-      lookback_days: LOOKBACK_DAYS,
-      stat: chosen.stat,
-      copy,
-      model: ANTHROPIC_MODEL,
-    },
-    { onConflict: "user_id,week_start", ignoreDuplicates: true },
+  const text = await callClaude(
+    buildUserMessage(lines, coverageSummary(coverage), priorClaims),
   );
+  if (text === null) return json(500, { error: "claude_call_failed" });
+
+  const parsed = extractJson(text);
+  const insights = parsed === null ? null : validateInsights(parsed);
+  if (insights === null) return json(500, { error: "bad_model_output" });
+
+  if (insights.length === 0) {
+    return json(200, { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" });
+  }
+
+  // ignoreDuplicates makes conflicting rows silent no-ops; .select() then
+  // returns only the rows actually inserted, which is our "new this run".
+  const { data: insertedRows, error: insErr } = await admin
+    .from("insights")
+    .upsert(
+      insights.map((i) => ({
+        user_id: userId,
+        claim: i.claim,
+        evidence: i.evidence,
+        confidence: i.confidence,
+        suggested_action: i.suggested_action,
+        window_days: WINDOW_DAYS,
+        claim_norm: normalizeClaim(i.claim),
+        model: ANTHROPIC_MODEL,
+      })),
+      { onConflict: "user_id,claim_norm", ignoreDuplicates: true },
+    )
+    .select("id");
   if (insErr) return json(500, { error: "insert_failed", detail: insErr.message });
 
-  return json(200, { surfaced: true, rule_id: chosen.rule_id, tier });
+  const inserted = insertedRows?.length ?? 0;
+  return json(200, { surfaced: inserted > 0, inserted });
 });
