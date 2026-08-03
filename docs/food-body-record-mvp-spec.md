@@ -89,37 +89,43 @@ The once-a-day energy + mood check-in.
 ### `health_days`
 Daily HealthKit aggregates. **Raw HealthKit reads stay on device.**
 
-| column           | type           | notes |
-|------------------|----------------|-------|
-| `id`             | uuid pk        | |
-| `user_id`        | uuid not null  | |
-| `day`            | date not null  | User's local date. **unique `(user_id, day)`** |
-| `steps`          | int            | Nullable (tier 1). |
-| `sleep_minutes`  | int            | Sleep that **started** this night (so `day d` pairs with the night d→d+1 needed by the steps×sleep rule). Nullable (tier 1). |
-| `resting_hr_bpm` | numeric(5,1)   | Nullable (tier 2). |
-| `hrv_ms`         | numeric(6,1)   | Nullable (tier 2). |
-| `tier`           | smallint not null default 0 | Computed: 0/1/2 based on which fields are present. |
-| `synced_at`      | timestamptz    | Last sync from device. |
-| `created_at`     | timestamptz default `now()` | |
-| `updated_at`     | timestamptz default `now()` | trigger-maintained |
+| column               | type           | notes |
+|----------------------|----------------|-------|
+| `id`                 | uuid pk        | |
+| `user_id`            | uuid not null  | |
+| `day`                | date not null  | User's local date. **unique `(user_id, day)`** |
+| `steps`              | int            | Nullable. |
+| `sleep_minutes`      | int            | Sleep that **started** this night (so `day d` pairs with the night d→d+1). Nullable. |
+| `resting_hr_bpm`     | numeric(5,1)   | Nullable. |
+| `hrv_ms`             | numeric(6,1)   | Nullable. |
+| `weight_kg`          | numeric(5,2)   | Nullable. Added for the insight-engine pivot — feeds the body-trend chart and the digest. |
+| `active_energy_kcal` | int            | Nullable. Added for the insight-engine pivot. |
+| `workout_minutes`    | int            | Nullable. Added for the insight-engine pivot. |
+| `tier`               | smallint not null default 0 | Computed client-side (0/1/2) from steps/sleep/RHR/HRV presence. **Informational only** — `generate-insights` does not gate on it; see that section for the current (coverage-based) gate. |
+| `synced_at`          | timestamptz    | Last sync from device. |
+| `created_at`         | timestamptz default `now()` | |
+| `updated_at`         | timestamptz default `now()` | trigger-maintained |
 
 ### `insights`
-One surfaced finding per user per week (or zero).
+Zero or more LLM-found correlations per run — **not** one templated
+finding per ISO week. `generate-insights` runs nightly (plus on-demand)
+over a rolling window and inserts whatever genuinely new patterns Claude
+finds, up to 5 per run. See `insight-rules` for how a pattern qualifies.
 
-| column         | type          | notes |
-|----------------|---------------|-------|
-| `id`           | uuid pk       | |
-| `user_id`      | uuid not null | |
-| `week_start`   | date not null | ISO week start (Mon). **unique `(user_id, week_start)`** |
-| `rule_id`      | text not null | check in (`'late_eat_energy'`,`'repeat_dish_energy'`,`'steps_sleep'`,`'late_eat_overnight'`) |
-| `tier`         | smallint not null | Effective tier at compute time. |
-| `lookback_days`| int not null  | Typically 28. |
-| `stat`         | jsonb not null | Computed numbers: `{ delta, n_a, n_b, mean_a, mean_b, rho, ... }`. Shape depends on rule. |
-| `copy`         | text not null | Claude-generated sentence. **≤ 22 words, hedged.** |
-| `model`        | text          | e.g. `'claude-sonnet-4-6'`. |
-| `created_at`   | timestamptz default `now()` | |
+| column             | type          | notes |
+|--------------------|---------------|-------|
+| `id`               | uuid pk       | |
+| `user_id`          | uuid not null | |
+| `claim`            | text not null | One hedged sentence naming the pattern, carrying real numbers from the digest. |
+| `evidence`         | text not null | The supporting comparison spelled out — which days, how many, the compared values. |
+| `confidence`       | text not null | check in (`'low'`,`'medium'`,`'high'`). `high` needs n≥8 supporting days, `medium` n≥6, `low` down to the n≥4 floor. |
+| `suggested_action` | text          | Nullable. A single gentle, observational next step. Never prescriptive, never a target, never medical. |
+| `window_days`      | int not null  | The lookback window used to find the claim; currently 30. |
+| `claim_norm`       | text not null | Lowercased, alphanumerics-only, whitespace-collapsed form of `claim`. **unique `(user_id, claim_norm)`** — the storage-layer "never repeat itself" backstop; the prompt-level "already surfaced" list (see `insight-rules`) is best-effort, this is the guarantee. |
+| `model`            | text          | e.g. `'claude-sonnet-4-6'`. |
+| `created_at`       | timestamptz default `now()` | |
 
-Index: `(user_id, week_start desc)` — for the "never repeat" check and the Insights screen.
+Index: `(user_id, created_at desc)` — for the "recent claims" prompt context and the Insights feed.
 
 ---
 
@@ -191,26 +197,51 @@ and sets `meals.parse_status = 'failed'`. The iOS decoder must handle this
 **Secrets:** `ANTHROPIC_API_KEY` lives in Edge Function secrets only.
 
 ### `generate-insights`
-**Trigger:** scheduled weekly via `pg_cron` (Mon 06:00 UTC). A SQL function
-`private.invoke_generate_insights_weekly()` fans out one async `pg_net`
-POST per user with activity in the lookback window. The base URL and
-shared cron secret live in `vault.decrypted_secrets`
-(`edge_function_base_url`, `insights_cron_secret`); the Edge Function
-authorizes the request by comparing the bearer token against the
-`INSIGHTS_CRON_SECRET` env var.
+**Trigger:** two auth paths.
+1. Nightly via `pg_cron` (03:30 UTC). A SQL function
+   `private.invoke_generate_insights_nightly()` fans out one async
+   `pg_net` POST per user who has logged a meal in the last 30 days. The
+   base URL and shared cron secret live in `vault.decrypted_secrets`
+   (`edge_function_base_url`, `insights_cron_secret`); the Edge Function
+   authorizes the request by comparing the bearer token against the
+   `INSIGHTS_CRON_SECRET` env var. The run is idempotent per user
+   (`claim_norm` dedupe), so a nightly re-run only inserts genuinely new
+   claims.
+2. On-demand: caller's own JWT as the bearer token, empty body `{}`. This
+   is what the iOS Insights screen's pull-to-refresh hits.
 
 **Behavior:**
-1. Determine tier from the past 28 days of `health_days`.
-2. For each rule whose minimum tier is met, compute the stat with the
-   thresholds in `insight-rules`. Skip if min-n unmet.
-3. Rank surfaced findings by effect size (normalized within rule), then
-   recency of supporting evidence.
-4. Drop any finding whose `rule_id + stat-shape` matches the **most recent
-   prior insight** for this user.
-5. If a finding remains, call Claude to write the one-sentence copy per
-   the copy contract; insert one row into `insights`.
-6. If nothing remains, **do not** write a row — the client shows the
-   "no-insights-yet" empty state.
+1. Load the caller's last 30 days of `meals`, `daily_checkins`, and
+   `health_days`.
+2. Compress into one line per day that has any signal, ascending by date,
+   plus a per-metric coverage count. Missing metrics are **omitted** from
+   the line, never rendered as zero.
+3. Gate: skip the Claude call entirely unless the window has **≥ 7 days
+   with a meal logged AND ≥ 7 days of the single best-covered body
+   signal** (energy check-in counts as the tier-0 body signal; coverage
+   is the max across metrics, not the sum — see `insight-rules`).
+4. Fetch the user's last 15 claims, most recent first, as a "do not
+   repeat" list for the prompt.
+5. Call Claude once with the digest + coverage counts + prior claims. It
+   returns a JSON array (at most 5) of
+   `{ claim, evidence, confidence, suggested_action }` per the copy
+   contract in `insight-rules`. An empty array is a valid, good answer —
+   "nothing qualifies" beats an invented pattern.
+6. Strict server-side validation of the model's output. Any structural
+   violation (wrong enum, empty string, more than 5 items, non-array)
+   rejects the **whole** payload — a partially-trustworthy run is worse
+   than no run; the next nightly/on-demand call just tries again.
+7. Upsert the validated claims with `onConflict: "user_id,claim_norm"`,
+   `ignoreDuplicates: true` — re-runs are safe no-ops for anything
+   already surfaced.
+
+**Response:**
+- `200 { surfaced: boolean, inserted: number }` — ran.
+- `200 { surfaced: false, inserted: 0, reason: "insufficient_data" }` — gated before the Claude call.
+- `200 { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" }` — Claude returned `[]`.
+- `500 { error: "bad_model_output" | "claude_call_failed" | "insert_failed" }`.
+
+**Secrets:** `ANTHROPIC_API_KEY`, `INSIGHTS_CRON_SECRET` (set via `supabase secrets set`).
 
 ### `submit-correction`
 **Trigger:** meal-detail "not quite right?" sheet.
