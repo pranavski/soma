@@ -107,10 +107,12 @@ Daily HealthKit aggregates. **Raw HealthKit reads stay on device.**
 | `updated_at`         | timestamptz default `now()` | trigger-maintained |
 
 ### `insights`
-Zero or more LLM-found correlations per run — **not** one templated
-finding per ISO week. `generate-insights` runs nightly (plus on-demand)
-over a rolling window and inserts whatever genuinely new patterns Claude
-finds, up to 5 per run. See `insight-rules` for how a pattern qualifies.
+Zero or more statistically-screened correlations per run — **not** one
+templated finding per ISO week. `generate-insights` runs nightly (plus
+on-demand) over a rolling window: TypeScript scores every food–body
+association and keeps what survives an FDR correction, then Claude selects
+from those survivors and writes them, up to 5 per run. See `insight-rules`
+for how a pattern qualifies.
 
 | column             | type          | notes |
 |--------------------|---------------|-------|
@@ -118,11 +120,13 @@ finds, up to 5 per run. See `insight-rules` for how a pattern qualifies.
 | `user_id`          | uuid not null | |
 | `claim`            | text not null | One hedged sentence naming the pattern, carrying real numbers from the digest. |
 | `evidence`         | text not null | The supporting comparison spelled out — which days, how many, the compared values. |
-| `confidence`       | text not null | check in (`'low'`,`'medium'`,`'high'`). `high` needs n≥8 supporting days, `medium` n≥6, `low` down to the n≥4 floor. |
+| `confidence`       | text not null | check in (`'low'`,`'medium'`,`'high'`). Derived from `support_days`, never self-reported by the model: `high` needs n≥8, `medium` n≥6, `low` down to the n≥4 floor. |
 | `suggested_action` | text          | Nullable. A single gentle, observational next step. Never prescriptive, never a target, never medical. |
 | `window_days`      | int not null  | The lookback window used to find the claim; currently 30. |
-| `claim_norm`       | text not null | Lowercased, alphanumerics-only, whitespace-collapsed form of `claim`. **unique `(user_id, claim_norm)`** — the storage-layer "never repeat itself" backstop; the prompt-level "already surfaced" list (see `insight-rules`) is best-effort, this is the guarantee. |
-| `model`            | text          | e.g. `'claude-sonnet-4-6'`. |
+| `pattern_key`      | text not null | The association's identity, independent of wording: `'<feature>_x_<signal>_lag<0\|1>'`. **unique `(user_id, pattern_key)`** — the "never repeat itself" guarantee, and the Edge Function's upsert conflict target. A rephrased repeat collides here where `claim_norm` would have missed it. |
+| `support_days`     | int not null  | Paired days behind the association (check `>= 4`). What `confidence` is derived from, kept so a claim can be audited against its own evidence base. |
+| `claim_norm`       | text not null | Lowercased, alphanumerics-only, whitespace-collapsed form of `claim`. Retained for debugging; no longer carries a uniqueness constraint (`pattern_key` subsumes it). |
+| `model`            | text          | e.g. `'claude-haiku-4-5'`. |
 | `created_at`       | timestamptz default `now()` | |
 
 Index: `(user_id, created_at desc)` — for the "recent claims" prompt context and the Insights feed.
@@ -205,7 +209,7 @@ and sets `meals.parse_status = 'failed'`. The iOS decoder must handle this
    (`edge_function_base_url`, `insights_cron_secret`); the Edge Function
    authorizes the request by comparing the bearer token against the
    `INSIGHTS_CRON_SECRET` env var. The run is idempotent per user
-   (`claim_norm` dedupe), so a nightly re-run only inserts genuinely new
+   (`pattern_key` dedupe), so a nightly re-run only inserts genuinely new
    claims.
 2. On-demand: caller's own JWT as the bearer token, empty body `{}`. This
    is what the iOS Insights screen's pull-to-refresh hits.
@@ -220,25 +224,35 @@ and sets `meals.parse_status = 'failed'`. The iOS decoder must handle this
    with a meal logged AND ≥ 7 days of the single best-covered body
    signal** (energy check-in counts as the tier-0 body signal; coverage
    is the max across metrics, not the sum — see `insight-rules`).
-4. Fetch the user's last 15 claims, most recent first, as a "do not
-   repeat" list for the prompt.
-5. Call Claude once with the digest + coverage counts + prior claims. It
-   returns a JSON array (at most 5) of
-   `{ claim, evidence, confidence, suggested_action }` per the copy
-   contract in `insight-rules`. An empty array is a valid, good answer —
-   "nothing qualifies" beats an invented pattern.
-6. Strict server-side validation of the model's output. Any structural
-   violation (wrong enum, empty string, more than 5 items, non-array)
-   rejects the **whole** payload — a partially-trustworthy run is worse
-   than no run; the next nightly/on-demand call just tries again.
-7. Upsert the validated claims with `onConflict: "user_id,claim_norm"`,
+4. Score candidate associations in TypeScript (`candidates.ts`): 6 per-day
+   food features × 8 body signals × 2 lags, each needing ≥ 4 paired days,
+   scored with Spearman ρ and a seeded permutation p-value, then filtered
+   by Benjamini–Hochberg at q = 0.10. Survivors are ranked by |ρ| and
+   capped at 20. See `insight-rules` for why the correction is
+   load-bearing.
+5. Drop any candidate whose `pattern_key` the user has already been shown.
+   If none remain, return without calling Claude.
+6. Fetch the user's last 15 claims, most recent first, to keep phrasing
+   fresh in the prompt.
+7. Call Claude once (`claude-haiku-4-5`) with the candidate table + digest
+   + coverage counts + prior claims, constrained by a JSON response
+   schema. It selects at most 5 candidates and returns
+   `{ candidate_id, claim, evidence, suggested_action }` each, per the copy
+   contract in `insight-rules`. Selecting none is a valid, good answer —
+   "nothing worth saying" beats an invented pattern. `confidence` is
+   **not** returned; it is derived from the candidate's `support_days`.
+8. Strict server-side validation. Any structural violation, an unknown or
+   reused `candidate_id`, or more than 5 items rejects the **whole**
+   payload — a partially-trustworthy run is worse than no run; the next
+   nightly/on-demand call just tries again.
+9. Upsert the validated claims with `onConflict: "user_id,pattern_key"`,
    `ignoreDuplicates: true` — re-runs are safe no-ops for anything
    already surfaced.
 
 **Response:**
 - `200 { surfaced: boolean, inserted: number }` — ran.
-- `200 { surfaced: false, inserted: 0, reason: "insufficient_data" }` — gated before the Claude call.
-- `200 { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" }` — Claude returned `[]`.
+- `200 { surfaced: false, inserted: 0, reason: "insufficient_data" }` — gated before scoring.
+- `200 { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" }` — nothing survived the correction, everything surviving was already surfaced, or Claude selected none.
 - `500 { error: "bad_model_output" | "claude_call_failed" | "insert_failed" }`.
 
 **Secrets:** `ANTHROPIC_API_KEY`, `INSIGHTS_CRON_SECRET` (set via `supabase secrets set`).

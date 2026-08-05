@@ -47,11 +47,13 @@ migration; the spec describes the columns, constraints, and intent.
 
 ## Edge Functions
 - Two functions in v1: `parse-meal` (image/voice → structured meal JSON via
-  Claude) and `generate-insights` (weekly job per user implementing the
-  rules in [[insight-rules]]).
+  Claude) and `generate-insights` (nightly job per user, plus on-demand —
+  see [[insight-rules]]).
 - **Anthropic API keys live ONLY in Edge Function secrets.** Never in the
   iOS bundle, never in a migration, never in source.
-- Model: `claude-sonnet-4-6` (per CLAUDE.md).
+- Models: `claude-sonnet-4-6` for `parse-meal`; `claude-haiku-4-5` for
+  `generate-insights`, which is cheap enough because the statistics happen
+  in TypeScript and the model only selects and writes.
 - Functions return strict JSON matching the contracts in the spec. If
   Claude returns malformed JSON, the function returns a 422 with a
   fallback payload — the client must handle this gracefully (see the

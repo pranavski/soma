@@ -1,9 +1,13 @@
 // generate-insights
 //
 // The insight engine. Compresses the caller's last 30 days of food logs,
-// energy check-ins, and HealthKit daily aggregates into a per-day digest,
-// hands it to Claude ONCE, and stores the returned correlations as
-// individual insight rows. TypeScript compresses; Claude reasons.
+// energy check-ins, and HealthKit daily aggregates, computes every
+// food-signal association over that window, keeps the ones that survive a
+// permutation test with an FDR correction, and hands that shortlist to
+// Claude ONCE to decide which are worth saying and to write the sentence.
+//
+// TypeScript owns every number. Claude owns judgment and language, and can
+// only describe a candidate we handed it — see validateInsights.
 //
 // Invocation — two auth paths:
 //   1. Cron/batch: Authorization matches INSIGHTS_CRON_SECRET,
@@ -39,10 +43,40 @@ import {
   normalizeClaim,
   validateInsights,
 } from "./digest.ts";
+import { type Candidate, buildCandidates, renderCandidates } from "./candidates.ts";
 
-const ANTHROPIC_MODEL = "claude-sonnet-4-6";
+// Haiku is the right tier now that the model no longer does arithmetic:
+// what is left is picking plausible rows out of a scored table and writing
+// one hedged sentence each. It is also the cheapest model that supports
+// structured outputs, which is what lets us drop the "return ONLY JSON"
+// pleading from the prompt.
+const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const WINDOW_DAYS = 30;
 const RECENT_CLAIMS_LIMIT = 15;
+
+/// Schema the response is constrained to. confidence is absent on purpose —
+/// it is derived from the candidate's supporting-day count, not claimed.
+const RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    insights: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          candidate_id: { type: "string", description: "id of the candidate this describes, e.g. c3" },
+          claim: { type: "string" },
+          evidence: { type: "string" },
+          suggested_action: { anyOf: [{ type: "string" }, { type: "null" }] },
+        },
+        required: ["candidate_id", "claim", "evidence", "suggested_action"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["insights"],
+  additionalProperties: false,
+} as const;
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -83,39 +117,38 @@ async function loadWindow(admin: SupabaseClient, userId: string) {
 
 // ─── Claude ─────────────────────────────────────────────────────────────────
 
-// The copy contract carries the soul of the old insight-rules skill —
-// hedged, never prescriptive, never medical, calories only as ranges —
-// but the finding itself now comes from the model, so the prompt also has
-// to police evidence discipline: real numbers, real day counts, n >= 4.
-const SYSTEM_PROMPT = `You are the insight engine for a food–body journal. You receive a per-day digest of one person's last ~30 days (meals with rough calorie/protein ranges, a 1–5 energy self-report, and daily HealthKit aggregates) plus per-metric coverage counts.
+// The statistics are settled before this prompt is built, so the model's job
+// is editorial: which of these survived-the-math associations are plausible
+// enough to say to a person, and how to say them. The copy contract carries
+// the soul of the insight-rules skill — hedged, never prescriptive, never
+// medical, calories only as ranges.
+const SYSTEM_PROMPT = `You are the insight engine for a food–body journal. You receive a shortlist of statistical associations already computed from one person's last ~30 days, plus the daily digest they were computed from.
 
-Find correlations and patterns in THIS person's data. Return ONLY a JSON array — no prose, no markdown, no code fences — of at most ${MAX_INSIGHTS} objects, each EXACTLY:
-{
-  "claim": string,
-  "evidence": string,
-  "confidence": "low" | "medium" | "high",
-  "suggested_action": string | null
-}
+Every candidate has already passed a permutation test with a false-discovery-rate correction. The arithmetic is done: n, rho, and the compared group averages are given to you. Do not recompute them, and do not cite any number that is not in the candidate line you are describing.
+
+Your job is judgment and language. For each candidate, decide whether it is worth telling this person about — a real, interpretable pattern in how they eat and how they feel — or whether it is a coincidence dressed up as a finding (spurious pairings, reversed causality, an association nobody could act on or even notice). Then write it.
+
+Select at most ${MAX_INSIGHTS} candidates. Selecting none is a good, honest answer; describing a candidate you do not believe is not.
 
 Rules — non-negotiable:
-- claim: one sentence naming a specific pattern in the data with real numbers from the digest (e.g. "Energy dips to 2/5 tend to follow sub-20g-protein mornings — 5 of the 6 such days"). NEVER generic nutrition advice. Hedged language only: "tends to", "seems", "is associated with". Never "causes", "makes you", "you should".
-- evidence: the supporting observation spelled out — which days, how many, the compared values (e.g. "mean energy 2.2/5 after the 6 low-protein mornings vs 3.6/5 after the 9 higher-protein ones").
-- confidence: high only for a consistent pattern with n ≥ 8 supporting days; medium for n ≥ 6; low otherwise.
-- A pattern needs at least 4 supporting days to be claimed at all. Fewer than 4 → do not include it.
-- Respect the coverage counts: never claim a trend in a metric with fewer than 4 days of data. Never treat a missing metric on a day as zero — missing means not synced.
+- claim: one sentence naming the pattern, using the numbers from that candidate's line (e.g. "Energy tends to run lower the day after your latest dinners — 2.2 of 5 across those 7 days against 3.6 on the earlier 9"). NEVER generic nutrition advice. Hedged language only: "tends to", "seems", "is associated with". Never "causes", "makes you", "you should".
+- evidence: the supporting observation spelled out — how many days on each side, and both compared averages.
 - suggested_action: a single gentle, observational next step ("worth watching whether earlier dinners shift this"), or null. Never prescriptive ("eat less X"), never a target, never medical.
 - Calories only ever as ranges ("~550–700"), never a bare number.
-- You will be given claims already shown to this person. Do not repeat or rephrase any of them — only genuinely new patterns.
-- If nothing meets the bar, return []. An empty array is a good answer; an invented pattern is not.`;
+- An association is not causation, and the copy must never imply it is.
+- You will be given claims already shown to this person. Do not repeat or rephrase any of them.
+- Set candidate_id to the id of the candidate each insight describes.`;
 
 function buildUserMessage(
+  candidates: Candidate[],
   digestLines: string[],
   coverage: string,
   priorClaims: string[],
 ): string {
   const blocks: string[] = [
+    `Candidate associations (already tested and corrected — these are the only things you may describe):\n${renderCandidates(candidates)}`,
     `Per-metric coverage over the window:\n${coverage}`,
-    `Daily digest (missing metrics = not synced, NOT zero):\n${digestLines.join("\n")}`,
+    `Daily digest, for context on whether each candidate is plausible (missing metrics = not synced, NOT zero):\n${digestLines.join("\n")}`,
   ];
   if (priorClaims.length > 0) {
     blocks.push(
@@ -123,7 +156,7 @@ function buildUserMessage(
         priorClaims.map((c) => `- ${c}`).join("\n"),
     );
   }
-  blocks.push("Return the JSON array now.");
+  blocks.push("Select and write the insights now.");
   return blocks.join("\n\n");
 }
 
@@ -141,7 +174,12 @@ async function callClaude(userMessage: string): Promise<string | null> {
       },
       body: JSON.stringify({
         model: ANTHROPIC_MODEL,
-        max_tokens: 2000,
+        max_tokens: 4096,
+        // Haiku 4.5 predates adaptive thinking, so this is the older fixed
+        // budget form (must be < max_tokens). Modest, but the plausible-vs-
+        // spurious call is the whole reason a model is in this loop.
+        thinking: { type: "enabled", budget_tokens: 2048 },
+        output_config: { format: { type: "json_schema", schema: RESPONSE_SCHEMA } },
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }],
       }),
@@ -216,6 +254,27 @@ serve(async (req) => {
     return json(200, { surfaced: false, inserted: 0, reason: "insufficient_data" });
   }
 
+  // Everything already shown to this person, by pattern rather than by
+  // wording — a rephrase of a surfaced finding never reaches the model.
+  const { data: seenRows } = await admin
+    .from("insights")
+    .select("pattern_key")
+    .eq("user_id", userId);
+  const seenPatterns = new Set(
+    (seenRows ?? []).map((r: { pattern_key: string }) => r.pattern_key),
+  );
+
+  const candidates = buildCandidates(meals, checkins, health)
+    .filter((c) => !seenPatterns.has(c.patternKey))
+    // Re-number so the ids the model cites are contiguous.
+    .map((c, i) => ({ ...c, id: `c${i + 1}` }));
+
+  // Nothing survived the correction, or everything that did is old news.
+  // Either way there is no call to make.
+  if (candidates.length === 0) {
+    return json(200, { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" });
+  }
+
   const { data: prior } = await admin
     .from("insights")
     .select("claim")
@@ -225,12 +284,13 @@ serve(async (req) => {
   const priorClaims = (prior ?? []).map((r: { claim: string }) => r.claim);
 
   const text = await callClaude(
-    buildUserMessage(lines, coverageSummary(coverage), priorClaims),
+    buildUserMessage(candidates, lines, coverageSummary(coverage), priorClaims),
   );
   if (text === null) return json(500, { error: "claude_call_failed" });
 
+  const byId = new Map(candidates.map((c) => [c.id, c]));
   const parsed = extractJson(text);
-  const insights = parsed === null ? null : validateInsights(parsed);
+  const insights = parsed === null ? null : validateInsights(parsed, new Set(byId.keys()));
   if (insights === null) return json(500, { error: "bad_model_output" });
 
   if (insights.length === 0) {
@@ -242,17 +302,23 @@ serve(async (req) => {
   const { data: insertedRows, error: insErr } = await admin
     .from("insights")
     .upsert(
-      insights.map((i) => ({
-        user_id: userId,
-        claim: i.claim,
-        evidence: i.evidence,
-        confidence: i.confidence,
-        suggested_action: i.suggested_action,
-        window_days: WINDOW_DAYS,
-        claim_norm: normalizeClaim(i.claim),
-        model: ANTHROPIC_MODEL,
-      })),
-      { onConflict: "user_id,claim_norm", ignoreDuplicates: true },
+      insights.map((i) => {
+        const c = byId.get(i.candidate_id)!;
+        return {
+          user_id: userId,
+          claim: i.claim,
+          evidence: i.evidence,
+          // Derived from the supporting-day count, not from the model.
+          confidence: c.confidence,
+          suggested_action: i.suggested_action,
+          window_days: WINDOW_DAYS,
+          pattern_key: c.patternKey,
+          support_days: c.n,
+          claim_norm: normalizeClaim(i.claim),
+          model: ANTHROPIC_MODEL,
+        };
+      }),
+      { onConflict: "user_id,pattern_key", ignoreDuplicates: true },
     )
     .select("id");
   if (insErr) return json(500, { error: "insert_failed", detail: insErr.message });

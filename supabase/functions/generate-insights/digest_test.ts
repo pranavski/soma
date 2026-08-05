@@ -148,18 +148,20 @@ Deno.test("extractJson strips code fences and parses", () => {
 // ─── validateInsights ───────────────────────────────────────────────────────
 
 const validInsight = {
+  candidate_id: "c1",
   claim: "Sleep under 6h tends to precede 2/5 energy days — 5 of 7 such days.",
   evidence: "mean energy 2.1/5 after the 7 short-sleep nights vs 3.5/5 after the 11 longer ones",
-  confidence: "medium",
   suggested_action: null,
 };
+
+const ids = new Set(["c1", "c2", "c3", "c4", "c5", "c6"]);
 
 Deno.test("validateInsights accepts a valid array and normalizes suggested_action", () => {
   const out = validateInsights([
     validInsight,
-    { ...validInsight, claim: "another claim", suggested_action: "  worth watching  " },
-    { ...validInsight, claim: "third claim", suggested_action: "" },
-  ]);
+    { ...validInsight, candidate_id: "c2", suggested_action: "  worth watching  " },
+    { ...validInsight, candidate_id: "c3", suggested_action: "" },
+  ], ids);
   assert(out !== null);
   assertEquals(out.length, 3);
   assertEquals(out[0].suggested_action, null);
@@ -167,16 +169,37 @@ Deno.test("validateInsights accepts a valid array and normalizes suggested_actio
   assertEquals(out[2].suggested_action, null); // empty string → null
 });
 
-Deno.test("validateInsights rejects structural violations wholesale", () => {
-  assertEquals(validateInsights({ claim: "not an array" }), null);
-  assertEquals(validateInsights([{ ...validInsight, confidence: "certain" }]), null);
-  assertEquals(validateInsights([{ ...validInsight, claim: "" }]), null);
-  assertEquals(validateInsights([{ ...validInsight, evidence: 42 }]), null);
-  assertEquals(validateInsights([validInsight, "rogue string"]), null);
-  const six = Array.from({ length: 6 }, (_, i) => ({ ...validInsight, claim: `claim ${i}` }));
-  assertEquals(validateInsights(six), null);
+Deno.test("validateInsights unwraps the schema's { insights: [...] } envelope", () => {
+  const out = validateInsights({ insights: [validInsight] }, ids);
+  assert(out !== null);
+  assertEquals(out.length, 1);
+  assertEquals(out[0].candidate_id, "c1");
 });
 
-Deno.test("validateInsights accepts an empty array (no qualifying patterns)", () => {
-  assertEquals(validateInsights([]), []);
+Deno.test("validateInsights rejects a claim citing a candidate we never sent", () => {
+  // The whole point of candidate ids: an invented finding has no id to cite.
+  assertEquals(validateInsights([{ ...validInsight, candidate_id: "c99" }], ids), null);
+  assertEquals(validateInsights([{ ...validInsight, candidate_id: "" }], ids), null);
+  assertEquals(validateInsights([validInsight], new Set<string>()), null);
+});
+
+Deno.test("validateInsights rejects two claims about the same candidate", () => {
+  assertEquals(
+    validateInsights([validInsight, { ...validInsight, claim: "restated" }], ids),
+    null,
+  );
+});
+
+Deno.test("validateInsights rejects structural violations wholesale", () => {
+  assertEquals(validateInsights({ claim: "not an array" }, ids), null);
+  assertEquals(validateInsights([{ ...validInsight, claim: "" }], ids), null);
+  assertEquals(validateInsights([{ ...validInsight, evidence: 42 }], ids), null);
+  assertEquals(validateInsights([validInsight, "rogue string"], ids), null);
+  const six = Array.from({ length: 6 }, (_, i) => ({ ...validInsight, candidate_id: `c${i + 1}` }));
+  assertEquals(validateInsights(six, ids), null);
+});
+
+Deno.test("validateInsights accepts an empty array (nothing worth surfacing)", () => {
+  assertEquals(validateInsights([], ids), []);
+  assertEquals(validateInsights({ insights: [] }, ids), []);
 });

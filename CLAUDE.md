@@ -9,8 +9,10 @@ streaks-shaming, no calorie targets, never medical advice.
 
 ## Stack
 SwiftUI iOS 17+, MVVM, async/await. Supabase (Auth via Sign in with Apple,
-Postgres, private Storage, Edge Functions). Claude API (claude-sonnet-4-6)
-called ONLY from Edge Functions. HealthKit read-only.
+Postgres, private Storage, Edge Functions). Claude API called ONLY from
+Edge Functions — `claude-sonnet-4-6` for parse-meal, `claude-haiku-4-5`
+for generate-insights (it selects and writes copy; it does no arithmetic).
+HealthKit read-only.
 
 ## Source-of-truth docs — read before relevant work
 - docs/food-body-record-mvp-spec.md  (schema, screens, insight rules)
