@@ -15,14 +15,17 @@
 //   2. On-demand: Authorization is a user JWT, body {} — generates for
 //      the caller. This is what the iOS pull-to-refresh hits.
 //
-// Response:
-//   200 { surfaced: boolean, inserted: number }            — ran
-//   200 { surfaced: false, reason: "insufficient_data" }   — gated, no Claude call
-//   500 { error: "bad_model_output" }                      — model broke contract
+// Response (`candidates` is the shortlist size, so a zero-insight run says
+// whether the statistics found nothing or the model declined what it saw):
+//   200 { surfaced, inserted, candidates }                        — ran
+//   200 { surfaced: false, reason: "insufficient_data" }          — gated before scoring
+//   200 { surfaced: false, reason: "no_qualifying_patterns", candidates } — nothing survived, or nothing chosen
+//   500 { error: "claude_call_failed", detail }                   — with the reason
+//   500 { error: "bad_model_output" }                             — model broke contract
 //
-// Dedupe is two-layered: the prompt carries the user's recent claims as
-// "do not repeat", and unique (user_id, claim_norm) in Postgres backstops
-// it — re-runs are inserts that silently no-op on conflict.
+// Dedupe is by pattern, not wording: already-surfaced pattern_keys are
+// filtered out before the model is called, and unique (user_id,
+// pattern_key) backstops it — re-runs no-op on conflict.
 //
 // Secrets required:
 //   ANTHROPIC_API_KEY
@@ -290,7 +293,12 @@ serve(async (req) => {
   // Nothing survived the correction, or everything that did is old news.
   // Either way there is no call to make.
   if (candidates.length === 0) {
-    return json(200, { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" });
+    return json(200, {
+      surfaced: false,
+      inserted: 0,
+      reason: "no_qualifying_patterns",
+      candidates: 0,
+    });
   }
 
   const { data: prior } = await admin
@@ -315,7 +323,14 @@ serve(async (req) => {
   if (insights === null) return json(500, { error: "bad_model_output" });
 
   if (insights.length === 0) {
-    return json(200, { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" });
+    // Distinct from the branch above: candidates existed, the model judged
+    // none of them worth saying. `candidates` separates the two in logs.
+    return json(200, {
+      surfaced: false,
+      inserted: 0,
+      reason: "no_qualifying_patterns",
+      candidates: candidates.length,
+    });
   }
 
   // ignoreDuplicates makes conflicting rows silent no-ops; .select() then
@@ -345,5 +360,5 @@ serve(async (req) => {
   if (insErr) return json(500, { error: "insert_failed", detail: insErr.message });
 
   const inserted = insertedRows?.length ?? 0;
-  return json(200, { surfaced: inserted > 0, inserted });
+  return json(200, { surfaced: inserted > 0, inserted, candidates: candidates.length });
 });
