@@ -12,6 +12,8 @@ import {
   benjaminiHochberg,
   buildCandidates,
   buildDayFeatures,
+  dropRestatements,
+  featureSeriesRho,
   buildDaySignals,
   confidenceForN,
   permutationP,
@@ -241,6 +243,74 @@ Deno.test("buildCandidates keeps only the stronger lag per feature/signal pairin
 
   const lastMealEnergy = cands.filter((c) => c.feature === "last_meal_hour" && c.signal === "energy");
   assertEquals(lastMealEnergy.length, 1);
+});
+
+// ─── redundancy ─────────────────────────────────────────────────────────────
+
+Deno.test("featureSeriesRho measures how closely two features track for this person", () => {
+  // Fixed breakfast: eating window is dinner hour minus a constant.
+  const fixed = buildDayFeatures([0, 1, 2, 3, 4, 5].flatMap((i) => [
+    meal({ eaten_date: day(i), eaten_hour: 8 }),
+    meal({ eaten_date: day(i), eaten_hour: 17 + i }),
+  ]));
+  assertAlmostEquals(featureSeriesRho(fixed, "last_meal_hour", "eating_window_h"), 1, 1e-9);
+
+  // Breakfast that moves opposite to dinner: the window is its own thing.
+  const varying = buildDayFeatures([0, 1, 2, 3, 4, 5].flatMap((i) => [
+    meal({ eaten_date: day(i), eaten_hour: 11 - i }),
+    meal({ eaten_date: day(i), eaten_hour: 18 + (i % 2) }),
+  ]));
+  assert(
+    Math.abs(featureSeriesRho(varying, "last_meal_hour", "eating_window_h")) < 0.7,
+    "a varying breakfast should decouple the eating window from dinner hour",
+  );
+});
+
+Deno.test("featureSeriesRho reports no relationship on too little overlap", () => {
+  // Below MIN_PAIR_DAYS we must not suppress a finding on thin evidence.
+  const thin = buildDayFeatures([0, 1].flatMap((i) => [
+    meal({ eaten_date: day(i), eaten_hour: 8 }),
+    meal({ eaten_date: day(i), eaten_hour: 19 + i }),
+  ]));
+  assertEquals(featureSeriesRho(thin, "last_meal_hour", "eating_window_h"), 0);
+});
+
+Deno.test("dropRestatements keeps the strongest of a restating group", () => {
+  const features = buildDayFeatures([0, 1, 2, 3, 4, 5].flatMap((i) => [
+    meal({ eaten_date: day(i), eaten_hour: 8 }),
+    meal({ eaten_date: day(i), eaten_hour: 17 + i }),
+  ]));
+  const strong = { feature: "last_meal_hour", signal: "energy", lagDays: 1 } as const;
+  const restatement = { feature: "eating_window_h", signal: "energy", lagDays: 1 } as const;
+  const otherSignal = { feature: "eating_window_h", signal: "sleep_minutes", lagDays: 1 } as const;
+  const otherLag = { feature: "eating_window_h", signal: "energy", lagDays: 0 } as const;
+
+  // Ranked strongest-first, as buildCandidates hands them over.
+  assertEquals(
+    dropRestatements([strong, restatement], features),
+    [strong],
+  );
+  // A different signal is a different finding, however alike the features.
+  assertEquals(
+    dropRestatements([strong, otherSignal], features).length,
+    2,
+  );
+  // So is a different lag — that case belongs to strongestLagPerPairing.
+  assertEquals(
+    dropRestatements([strong, otherLag], features).length,
+    2,
+  );
+});
+
+Deno.test("buildCandidates does not surface a feature that restates a stronger one", () => {
+  // plantedWindow holds breakfast at 08h, so eating window and last-meal
+  // hour are the same fact. Only one may reach the feed.
+  const { meals, checkins, health } = plantedWindow();
+  const againstEnergy = buildCandidates(meals, checkins, health)
+    .filter((c) => c.signal === "energy")
+    .map((c) => c.feature);
+  const timing = againstEnergy.filter((f) => f === "last_meal_hour" || f === "eating_window_h");
+  assertEquals(timing.length, 1, `both timing features surfaced: ${againstEnergy.join(", ")}`);
 });
 
 Deno.test("buildCandidates assigns contiguous ids ranked by |rho|", () => {

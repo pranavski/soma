@@ -117,6 +117,19 @@ about their own body. Detection is limited by having ~26 paired days, not
 by the threshold; the lever that would actually move it is a longer
 `WINDOW_DAYS`, which is a product decision, not a statistical one.
 
+**One finding per group of features that restate each other.** Two
+features can be the same fact for a given person: when breakfast sits at a
+fixed hour, "eating window" is just "dinner hour" minus a constant, so
+both surface against energy and the feed says one thing twice in different
+words. Among survivors sharing a **signal and a lag**, if the two features
+correlate at |ρ| ≥ **0.7** *for this person*, only the stronger is kept.
+
+Measured per person, not hardcoded as a feature blocklist — someone whose
+breakfast time genuinely varies has an eating window independent of their
+dinner hour, and both findings deserve to surface for them. Below
+`MIN_PAIR_DAYS` of overlap the two count as distinct, so a finding is
+never suppressed on thin evidence.
+
 The survivors are then ranked by |ρ|, capped at **20**, and given ids
 (`c1`, `c2`, …) plus a **median split** into lower/higher groups so the
 evidence line can say "the 7 latest dinners vs the 9 earlier ones" instead

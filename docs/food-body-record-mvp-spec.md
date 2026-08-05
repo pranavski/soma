@@ -229,9 +229,11 @@ and sets `meals.parse_status = 'failed'`. The iOS decoder must handle this
    cross-product — every extra hypothesis tightens the threshold for the
    rest), each tested at 2 lags and needing ≥ 4 paired days, scored with
    Spearman ρ and a 10,000-shuffle seeded permutation p-value, then
-   filtered by Benjamini–Hochberg at q = 0.10. Only the stronger lag per
-   pairing is kept, collapsed *after* the correction. Survivors are ranked
-   by |ρ| and capped at 20. See `insight-rules` for why the correction is
+   filtered by Benjamini–Hochberg at q = 0.10. Survivors are then thinned
+   twice, both *after* the correction: one lag per pairing, and one finding
+   per group of features that restate each other for this person (features
+   correlating at |ρ| ≥ 0.7 against the same signal and lag). Ranked by |ρ|
+   and capped at 20. See `insight-rules` for why the correction is
    load-bearing, why the allowlist exists, and why q stays at 0.10.
 5. Drop any candidate whose `pattern_key` the user has already been shown.
    If none remain, return without calling Claude.

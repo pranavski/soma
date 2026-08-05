@@ -4,10 +4,11 @@
 // (see candidates_test.ts) without serving the function.
 //
 // This module owns every number the app ever shows a person. It derives
-// per-day food features, pairs each against every body signal at lag 0 and
-// lag 1, ranks the associations by Spearman rho, and keeps only the ones
-// that survive a permutation test with a Benjamini-Hochberg correction for
-// having looked at ~100 of them.
+// per-day food features, tests an allowlist of food/signal pairings at lag
+// 0 and lag 1, and keeps only the associations that survive a permutation
+// test with a Benjamini-Hochberg correction for having looked at ~28 of
+// them. What is left is then thinned twice more: one lag per pairing, and
+// one finding per group of features that restate each other.
 //
 // The model never does arithmetic. It receives this table and decides which
 // rows are worth saying out loud, then writes the sentence. Anything it
@@ -45,6 +46,18 @@ export const FDR_Q = 0.10;
 
 /// Ceiling on how many candidates the model is shown. Ranked by |rho|.
 export const MAX_CANDIDATES = 20;
+
+/// Above this correlation between two features, a finding about one is a
+/// restatement of a finding about the other. When breakfast sits at a fixed
+/// hour, "eating window" is just "dinner hour" minus a constant, and
+/// surfacing both against energy tells someone the same thing twice in
+/// different words.
+///
+/// Measured per person rather than hardcoded as a feature blocklist: a
+/// person whose breakfast time genuinely varies has an eating window that
+/// is independent of their dinner hour, and both findings deserve to
+/// surface for them.
+export const REDUNDANT_FEATURE_RHO = 0.7;
 
 /// Permutation iterations per candidate. The smallest p-value this test can
 /// report is 1/(PERMUTATIONS+1), so at 2000 it could not resolve values
@@ -441,10 +454,58 @@ export function buildCandidates(
   // lags first would mean correcting for ~48 tests after looking at ~96.
   const keep = benjaminiHochberg(raw.map((r) => r.pValue), q);
 
-  return strongestLagPerPairing(raw.filter((_, i) => keep[i]))
-    .sort((a, b) => Math.abs(b.rho) - Math.abs(a.rho))
+  const survivors = strongestLagPerPairing(raw.filter((_, i) => keep[i]))
+    .sort((a, b) => Math.abs(b.rho) - Math.abs(a.rho));
+
+  return dropRestatements(survivors, features)
     .slice(0, max)
     .map((r, i) => ({ ...r, id: `c${i + 1}`, confidence: confidenceForN(r.n) }));
+}
+
+/// How closely two food features track each other for THIS person, over the
+/// days where both are known.
+export function featureSeriesRho(
+  features: Map<string, DayFeatures>,
+  a: FeatureKey,
+  b: FeatureKey,
+): number {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const f of features.values()) {
+    const av = f[a];
+    const bv = f[b];
+    if (av === undefined || bv === undefined) continue;
+    xs.push(av);
+    ys.push(bv);
+  }
+  // Too little overlap to judge; treat them as distinct rather than
+  // suppressing a finding on thin evidence.
+  if (xs.length < MIN_PAIR_DAYS) return 0;
+  return spearman(xs, ys);
+}
+
+/// Walk strongest-first and drop anything that restates a finding already
+/// kept about the same signal at the same lag.
+///
+/// Same lag is required: "later dinners, lower energy next day" and
+/// "later dinners, lower energy same day" are different statements even
+/// though the feature is identical, and `strongestLagPerPairing` already
+/// handles that case. This is only about two different features saying one
+/// thing.
+export function dropRestatements<T extends { feature: FeatureKey; signal: SignalKey; lagDays: 0 | 1 }>(
+  ranked: T[],
+  features: Map<string, DayFeatures>,
+): T[] {
+  const kept: T[] = [];
+  for (const c of ranked) {
+    const restatesAKeptOne = kept.some((k) =>
+      k.signal === c.signal &&
+      k.lagDays === c.lagDays &&
+      Math.abs(featureSeriesRho(features, k.feature, c.feature)) >= REDUNDANT_FEATURE_RHO
+    );
+    if (!restatesAKeptOne) kept.push(c);
+  }
+  return kept;
 }
 
 /// Keep one lag per (feature, signal). When someone's routine has any
