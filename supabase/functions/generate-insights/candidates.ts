@@ -383,12 +383,41 @@ export function buildCandidates(
     }
   }
 
+  // Correct across every pairing we tested, including both lags. Collapsing
+  // lags first would mean correcting for ~48 tests after looking at ~96.
   const keep = benjaminiHochberg(raw.map((r) => r.pValue), q);
-  return raw
-    .filter((_, i) => keep[i])
+
+  return strongestLagPerPairing(raw.filter((_, i) => keep[i]))
     .sort((a, b) => Math.abs(b.rho) - Math.abs(a.rho))
     .slice(0, max)
     .map((r, i) => ({ ...r, id: `c${i + 1}`, confidence: confidenceForN(r.n) }));
+}
+
+/// Keep one lag per (feature, signal). When someone's routine has any
+/// periodicity — alternating late and early dinners, a weekday/weekend
+/// rhythm — the same feature is genuinely associated with the same signal
+/// at BOTH lags, in opposite directions. Both are real, and surfacing both
+/// reads as the app contradicting itself ("later dinners give you more
+/// energy today and less tomorrow"). Keep the stronger one.
+function strongestLagPerPairing<T extends { feature: FeatureKey; signal: SignalKey; rho: number; pValue: number; lagDays: 0 | 1 }>(
+  cands: T[],
+): T[] {
+  const best = new Map<string, T>();
+  for (const c of cands) {
+    const pairing = `${c.feature}_x_${c.signal}`;
+    const held = best.get(pairing);
+    if (held === undefined || beats(c, held)) best.set(pairing, c);
+  }
+  return [...best.values()];
+}
+
+/// Strongest association wins; ties break on p-value, then on lag so the
+/// choice is deterministic rather than dependent on enumeration order.
+function beats(a: { rho: number; pValue: number; lagDays: 0 | 1 }, b: { rho: number; pValue: number; lagDays: 0 | 1 }): boolean {
+  const da = Math.abs(a.rho), db = Math.abs(b.rho);
+  if (da !== db) return da > db;
+  if (a.pValue !== b.pValue) return a.pValue < b.pValue;
+  return a.lagDays < b.lagDays;
 }
 
 // ─── Prompt rendering ───────────────────────────────────────────────────────

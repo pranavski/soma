@@ -85,8 +85,17 @@ the one thing it exists not to do. At n=4 the smallest attainable p is
 ~0.083, so thin data almost never survives — the statistics enforce the
 floor rather than the prompt asking nicely.
 
-The surviving associations are ranked by |ρ|, capped at **20**, and given
-ids (`c1`, `c2`, …) plus a **median split** into lower/higher groups so the
+**Only the stronger lag survives per (feature, signal) pairing.** When
+someone's routine has any periodicity — alternating late and early
+dinners, a weekday/weekend rhythm — the same feature is genuinely
+associated with the same signal at *both* lags, in opposite directions.
+Both are real; surfacing both reads as the app contradicting itself
+("later dinners give you more energy today and less tomorrow"). The
+collapse happens **after** the BH correction, not before: correcting for
+~48 tests when we looked at ~96 would under-count what was tested.
+
+The survivors are then ranked by |ρ|, capped at **20**, and given ids
+(`c1`, `c2`, …) plus a **median split** into lower/higher groups so the
 evidence line can say "the 7 latest dinners vs the 9 earlier ones" instead
 of quoting a correlation coefficient at someone.
 
@@ -122,6 +131,9 @@ if any id is unknown or reused, so an invented finding has nothing to cite.
 - Calories only ever as ranges ("~550–700"), never a bare number.
 - An association is not causation and the copy must never imply it is.
 - No number may appear that isn't on the cited candidate's line.
+- **Never name a statistic.** ρ, p-values, and the word "correlation" are
+  given to the model to judge strength, not to repeat. The reader gets the
+  comparison; "n=14" reaches them as "14 days".
 
 ## Never repeat — by pattern, not by wording
 `pattern_key` is the association's identity, independent of language:

@@ -202,6 +202,21 @@ Deno.test("buildCandidates finds a planted association and scores it", () => {
   assertEquals(hit.low.n + hit.high.n, 20);
 });
 
+Deno.test("buildCandidates keeps only the stronger lag per feature/signal pairing", () => {
+  // plantedWindow alternates dinner time every day, so same-day energy is
+  // necessarily anti-correlated with same-day dinner hour while next-day
+  // energy is correlated with it. Both associations are real; surfacing
+  // both would read as the app contradicting itself.
+  const { meals, checkins, health } = plantedWindow();
+  const cands = buildCandidates(meals, checkins, health);
+
+  const pairings = cands.map((c) => `${c.feature}_x_${c.signal}`);
+  assertEquals(pairings.length, new Set(pairings).size, "a pairing appeared at both lags");
+
+  const lastMealEnergy = cands.filter((c) => c.feature === "last_meal_hour" && c.signal === "energy");
+  assertEquals(lastMealEnergy.length, 1);
+});
+
 Deno.test("buildCandidates assigns contiguous ids ranked by |rho|", () => {
   const { meals, checkins, health } = plantedWindow();
   const cands = buildCandidates(meals, checkins, health);

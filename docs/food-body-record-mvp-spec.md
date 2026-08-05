@@ -227,9 +227,10 @@ and sets `meals.parse_status = 'failed'`. The iOS decoder must handle this
 4. Score candidate associations in TypeScript (`candidates.ts`): 6 per-day
    food features × 8 body signals × 2 lags, each needing ≥ 4 paired days,
    scored with Spearman ρ and a seeded permutation p-value, then filtered
-   by Benjamini–Hochberg at q = 0.10. Survivors are ranked by |ρ| and
-   capped at 20. See `insight-rules` for why the correction is
-   load-bearing.
+   by Benjamini–Hochberg at q = 0.10. Only the stronger lag per
+   (feature, signal) pairing is kept, collapsed *after* the correction.
+   Survivors are ranked by |ρ| and capped at 20. See `insight-rules` for
+   why the correction is load-bearing and why both lags can qualify.
 5. Drop any candidate whose `pattern_key` the user has already been shown.
    If none remain, return without calling Claude.
 6. Fetch the user's last 15 claims, most recent first, to keep phrasing

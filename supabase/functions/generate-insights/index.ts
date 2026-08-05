@@ -133,6 +133,7 @@ Select at most ${MAX_INSIGHTS} candidates. Selecting none is a good, honest answ
 Rules — non-negotiable:
 - claim: one sentence naming the pattern, using the numbers from that candidate's line (e.g. "Energy tends to run lower the day after your latest dinners — 2.2 of 5 across those 7 days against 3.6 on the earlier 9"). NEVER generic nutrition advice. Hedged language only: "tends to", "seems", "is associated with". Never "causes", "makes you", "you should".
 - evidence: the supporting observation spelled out — how many days on each side, and both compared averages.
+- Never name a statistic in the copy. rho, p-values, and "correlation" are given to you so you can judge strength; the reader gets the comparison, not the coefficient. "n=14" is fine as "14 days".
 - suggested_action: a single gentle, observational next step ("worth watching whether earlier dinners shift this"), or null. Never prescriptive ("eat less X"), never a target, never medical.
 - Calories only ever as ranges ("~550–700"), never a bare number.
 - An association is not causation, and the copy must never imply it is.
@@ -160,9 +161,15 @@ function buildUserMessage(
   return blocks.join("\n\n");
 }
 
-async function callClaude(userMessage: string): Promise<string | null> {
+/// Why a call failed, not just that it did. This job runs unattended
+/// nightly across every active user; "claude_call_failed" with no reason
+/// is indistinguishable between a missing key, a rate limit, and a
+/// malformed request, and there is no one watching to reproduce it.
+type ClaudeResult = { ok: true; text: string } | { ok: false; reason: string };
+
+async function callClaude(userMessage: string): Promise<ClaudeResult> {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) return null;
+  if (!apiKey) return { ok: false, reason: "missing_api_key" };
   let res: Response;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -184,18 +191,29 @@ async function callClaude(userMessage: string): Promise<string | null> {
         messages: [{ role: "user", content: userMessage }],
       }),
     });
-  } catch {
-    return null;
+  } catch (e) {
+    return { ok: false, reason: `fetch_failed: ${e instanceof Error ? e.message : e}` };
   }
-  if (!res.ok) return null;
-  let payload: { content?: { type?: string; text?: string }[] };
+  if (!res.ok) {
+    // The error body carries the API's own explanation (rate_limit_error,
+    // invalid_request_error and which field, overloaded_error). It never
+    // contains the key.
+    const body = await res.text().catch(() => "");
+    return { ok: false, reason: `http_${res.status}: ${body.slice(0, 400)}` };
+  }
+  let payload: { content?: { type?: string; text?: string }[]; stop_reason?: string };
   try {
     payload = await res.json();
   } catch {
-    return null;
+    return { ok: false, reason: "response_not_json" };
   }
   const text = payload?.content?.find((b) => b?.type === "text")?.text;
-  return typeof text === "string" ? text : null;
+  if (typeof text !== "string") {
+    // A thinking-only response means the budget swallowed the answer;
+    // stop_reason tells us which.
+    return { ok: false, reason: `no_text_block (stop_reason=${payload?.stop_reason ?? "?"})` };
+  }
+  return { ok: true, text };
 }
 
 // ─── Auth ───────────────────────────────────────────────────────────────────
@@ -283,13 +301,16 @@ serve(async (req) => {
     .limit(RECENT_CLAIMS_LIMIT);
   const priorClaims = (prior ?? []).map((r: { claim: string }) => r.claim);
 
-  const text = await callClaude(
+  const result = await callClaude(
     buildUserMessage(candidates, lines, coverageSummary(coverage), priorClaims),
   );
-  if (text === null) return json(500, { error: "claude_call_failed" });
+  if (!result.ok) {
+    console.error(`generate-insights: claude call failed — ${result.reason}`);
+    return json(500, { error: "claude_call_failed", detail: result.reason });
+  }
 
   const byId = new Map(candidates.map((c) => [c.id, c]));
-  const parsed = extractJson(text);
+  const parsed = extractJson(result.text);
   const insights = parsed === null ? null : validateInsights(parsed, new Set(byId.keys()));
   if (insights === null) return json(500, { error: "bad_model_output" });
 
