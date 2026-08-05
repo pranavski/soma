@@ -224,13 +224,15 @@ and sets `meals.parse_status = 'failed'`. The iOS decoder must handle this
    with a meal logged AND ≥ 7 days of the single best-covered body
    signal** (energy check-in counts as the tier-0 body signal; coverage
    is the max across metrics, not the sum — see `insight-rules`).
-4. Score candidate associations in TypeScript (`candidates.ts`): 6 per-day
-   food features × 8 body signals × 2 lags, each needing ≥ 4 paired days,
-   scored with Spearman ρ and a seeded permutation p-value, then filtered
-   by Benjamini–Hochberg at q = 0.10. Only the stronger lag per
-   (feature, signal) pairing is kept, collapsed *after* the correction.
-   Survivors are ranked by |ρ| and capped at 20. See `insight-rules` for
-   why the correction is load-bearing and why both lags can qualify.
+4. Score candidate associations in TypeScript (`candidates.ts`): an
+   allowlist of 14 food-feature × body-signal pairings (not the 48-way
+   cross-product — every extra hypothesis tightens the threshold for the
+   rest), each tested at 2 lags and needing ≥ 4 paired days, scored with
+   Spearman ρ and a 10,000-shuffle seeded permutation p-value, then
+   filtered by Benjamini–Hochberg at q = 0.10. Only the stronger lag per
+   pairing is kept, collapsed *after* the correction. Survivors are ranked
+   by |ρ| and capped at 20. See `insight-rules` for why the correction is
+   load-bearing, why the allowlist exists, and why q stays at 0.10.
 5. Drop any candidate whose `pattern_key` the user has already been shown.
    If none remain, return without calling Claude.
 6. Fetch the user's last 15 claims, most recent first, to keep phrasing

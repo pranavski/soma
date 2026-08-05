@@ -6,6 +6,9 @@ import {
 } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { type CheckinRow, type HealthDayRow, type MealRow } from "./digest.ts";
 import {
+  FEATURE_KEYS,
+  PAIRINGS,
+  SIGNAL_KEYS,
   benjaminiHochberg,
   buildCandidates,
   buildDayFeatures,
@@ -200,6 +203,29 @@ Deno.test("buildCandidates finds a planted association and scores it", () => {
   // Median split: the later dinners sit lower on energy than the earlier ones.
   assert(hit.high.meanSignal < hit.low.meanSignal);
   assertEquals(hit.low.n + hit.high.n, 20);
+});
+
+Deno.test("PAIRINGS is an allowlist, not the cross-product", () => {
+  // Every extra hypothesis tightens the FDR threshold for all the others,
+  // so this list staying short is load-bearing, not tidiness.
+  assert(PAIRINGS.length < FEATURE_KEYS.length * SIGNAL_KEYS.length / 2,
+    `${PAIRINGS.length} pairings is approaching the ${FEATURE_KEYS.length * SIGNAL_KEYS.length} cross-product`);
+
+  const seen = new Set(PAIRINGS.map(([f, s]) => `${f}_x_${s}`));
+  assertEquals(seen.size, PAIRINGS.length, "duplicate pairing");
+
+  for (const [f, s] of PAIRINGS) {
+    assert(FEATURE_KEYS.includes(f), `unknown feature ${f}`);
+    assert(SIGNAL_KEYS.includes(s), `unknown signal ${s}`);
+  }
+});
+
+Deno.test("buildCandidates never returns a pairing outside the allowlist", () => {
+  const { meals, checkins, health } = plantedWindow();
+  const allowed = new Set(PAIRINGS.map(([f, s]) => `${f}_x_${s}`));
+  for (const c of buildCandidates(meals, checkins, health)) {
+    assert(allowed.has(`${c.feature}_x_${c.signal}`), `${c.patternKey} is not allowlisted`);
+  }
 });
 
 Deno.test("buildCandidates keeps only the stronger lag per feature/signal pairing", () => {

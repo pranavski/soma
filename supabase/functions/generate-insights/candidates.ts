@@ -27,15 +27,32 @@ export const MIN_PAIR_DAYS = 4;
 /// Benjamini-Hochberg false-discovery rate. 0.10 rather than 0.05: this is
 /// exploratory, every claim ships hedged, and 0.05 over a 30-day window
 /// surfaces essentially nothing.
+///
+/// Measured over 20 synthetic 30-day windows per cell (pure-noise windows
+/// producing any finding / windows producing a finding when a late-dinner
+/// effect is deterministic):
+///
+///   q=0.10   0/20 false   7/20 detected
+///   q=0.15   1/20 false   9/20 detected
+///   q=0.20   1/20 false  11/20 detected
+///
+/// Loosening buys detection by giving up the zero-false-positive property,
+/// which is the one this app cannot trade — a false positive here means
+/// telling someone an invented thing about their own body. Detection is
+/// limited by having ~26 paired days, not by the threshold; the lever that
+/// actually moves it is a longer WINDOW_DAYS, which is a product decision.
 export const FDR_Q = 0.10;
 
 /// Ceiling on how many candidates the model is shown. Ranked by |rho|.
 export const MAX_CANDIDATES = 20;
 
-/// Permutation iterations per candidate. ~100 candidates x 2000 shuffles of
-/// <=30 points is a few hundred milliseconds — cheap enough to run inline,
-/// and it avoids assuming a t-distribution at n=5.
-export const PERMUTATIONS = 2000;
+/// Permutation iterations per candidate. The smallest p-value this test can
+/// report is 1/(PERMUTATIONS+1), so at 2000 it could not resolve values
+/// below 0.0005 — uncomfortably close to the FDR threshold it was being
+/// judged against. 10000 puts the floor an order of magnitude below the
+/// threshold, and ~28 hypotheses x 10000 shuffles of <=30 points still runs
+/// in well under a second.
+export const PERMUTATIONS = 10_000;
 
 // ─── Feature and signal definitions ─────────────────────────────────────────
 
@@ -101,6 +118,45 @@ const FEATURE_DECIMALS: Record<FeatureKey, number> = {
 
 export const FEATURE_KEYS = Object.keys(FEATURE_LABELS) as FeatureKey[];
 export const SIGNAL_KEYS = Object.keys(SIGNAL_LABELS) as SignalKey[];
+
+/// The hypotheses we are willing to test, rather than the full 6x8
+/// cross-product.
+///
+/// Every extra pairing tightens the FDR threshold for all the others, so
+/// testing meal_count against weight or first-meal-hour against HRV does not
+/// just add noise — it actively buries the findings we care about. Measured:
+/// against the full cross-product, a *deterministic* late-dinner effect
+/// surfaced in only 5 of 20 synthetic windows.
+///
+/// The cross-product also made the threshold depend on how much HealthKit
+/// data someone had synced: more signals meant more hypotheses meant a
+/// stricter bar, so connecting a scale made every other finding harder to
+/// surface. A fixed list removes that.
+///
+/// Each entry is tested at both lags; `strongestLagPerPairing` then keeps
+/// one. Additions are cheap to make and expensive to everyone else — add a
+/// pairing only when there is a reason to expect a relationship.
+export const PAIRINGS: ReadonlyArray<readonly [FeatureKey, SignalKey]> = [
+  // Meal timing against how the body feels and recovers overnight.
+  ["last_meal_hour", "energy"],
+  ["last_meal_hour", "sleep_minutes"],
+  ["last_meal_hour", "resting_hr_bpm"],
+  ["last_meal_hour", "hrv_ms"],
+  ["first_meal_hour", "energy"],
+  ["eating_window_h", "energy"],
+  ["eating_window_h", "sleep_minutes"],
+
+  // How much, against how it feels and where it shows up.
+  ["total_kcal", "energy"],
+  ["total_kcal", "weight_kg"],
+  ["total_kcal", "steps"],
+  ["total_kcal", "active_energy_kcal"],
+  ["meal_count", "energy"],
+
+  // Protein against energy and training.
+  ["total_protein_g", "energy"],
+  ["total_protein_g", "workout_minutes"],
+];
 
 // ─── Per-day food features ──────────────────────────────────────────────────
 
@@ -323,9 +379,9 @@ function splitGroups(pairs: { f: number; s: number }[]): { low: Group; high: Gro
   };
 }
 
-/// Enumerate every food-feature x body-signal pairing at lag 0 and lag 1,
-/// keep the ones that survive the permutation test after FDR correction,
-/// and return the strongest MAX_CANDIDATES of those.
+/// Test each allowlisted PAIRINGS entry at lag 0 and lag 1, keep the ones
+/// that survive the permutation test after FDR correction, collapse to one
+/// lag per pairing, and return the strongest MAX_CANDIDATES of those.
 export function buildCandidates(
   meals: MealRow[],
   checkins: CheckinRow[],
@@ -342,44 +398,42 @@ export function buildCandidates(
   type Raw = Omit<Candidate, "id" | "confidence">;
   const raw: Raw[] = [];
 
-  for (const feature of FEATURE_KEYS) {
-    for (const signal of SIGNAL_KEYS) {
-      for (const lagDays of [0, 1] as const) {
-        const pairs: { f: number; s: number }[] = [];
-        for (const [day, f] of features) {
-          const fv = f[feature];
-          if (fv === undefined) continue;
-          const sv = signals.get(lagDays === 0 ? day : nextDay(day))?.[signal];
-          if (sv === undefined) continue;
-          pairs.push({ f: fv, s: sv });
-        }
-        if (pairs.length < MIN_PAIR_DAYS) continue;
-
-        const fs = pairs.map((p) => p.f);
-        const ss = pairs.map((p) => p.s);
-        // A constant feature or signal has no association to measure.
-        if (new Set(fs).size < 2 || new Set(ss).size < 2) continue;
-
-        const groups = splitGroups(pairs);
-        if (groups === null) continue;
-
-        const rho = spearman(fs, ss);
-        const pValue = permutationP(fs, ss, rho, permutations);
-
-        raw.push({
-          patternKey: `${feature}_x_${signal}_lag${lagDays}`,
-          feature,
-          signal,
-          featureLabel: FEATURE_LABELS[feature],
-          signalLabel: SIGNAL_LABELS[signal],
-          lagDays,
-          n: pairs.length,
-          rho,
-          pValue,
-          low: groups.low,
-          high: groups.high,
-        });
+  for (const [feature, signal] of PAIRINGS) {
+    for (const lagDays of [0, 1] as const) {
+      const pairs: { f: number; s: number }[] = [];
+      for (const [day, f] of features) {
+        const fv = f[feature];
+        if (fv === undefined) continue;
+        const sv = signals.get(lagDays === 0 ? day : nextDay(day))?.[signal];
+        if (sv === undefined) continue;
+        pairs.push({ f: fv, s: sv });
       }
+      if (pairs.length < MIN_PAIR_DAYS) continue;
+
+      const fs = pairs.map((p) => p.f);
+      const ss = pairs.map((p) => p.s);
+      // A constant feature or signal has no association to measure.
+      if (new Set(fs).size < 2 || new Set(ss).size < 2) continue;
+
+      const groups = splitGroups(pairs);
+      if (groups === null) continue;
+
+      const rho = spearman(fs, ss);
+      const pValue = permutationP(fs, ss, rho, permutations);
+
+      raw.push({
+        patternKey: `${feature}_x_${signal}_lag${lagDays}`,
+        feature,
+        signal,
+        featureLabel: FEATURE_LABELS[feature],
+        signalLabel: SIGNAL_LABELS[signal],
+        lagDays,
+        n: pairs.length,
+        rho,
+        pValue,
+        low: groups.low,
+        high: groups.high,
+      });
     }
   }
 

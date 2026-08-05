@@ -184,7 +184,13 @@ async function callClaude(userMessage: string): Promise<ClaudeResult> {
       },
       body: JSON.stringify({
         model: ANTHROPIC_MODEL,
-        max_tokens: 4096,
+        // max_tokens covers thinking AND the response. At 4096 against a
+        // 2048 thinking budget, roughly one run in ten spent the remainder
+        // deliberating and stopped before emitting any text at all
+        // (stop_reason=max_tokens, no text block). Five insights need well
+        // under 2000 tokens; the headroom is what keeps a nightly run from
+        // failing on a long deliberation.
+        max_tokens: 8192,
         // Haiku 4.5 predates adaptive thinking, so this is the older fixed
         // budget form (must be < max_tokens). Modest, but the plausible-vs-
         // spurious call is the whole reason a model is in this loop.

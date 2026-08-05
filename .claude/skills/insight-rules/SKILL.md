@@ -69,21 +69,36 @@ digest. `candidates.ts` enumerates the search space instead:
   hour, last meal hour, eating window, meal count. Calorie and protein
   totals are computed **only when every meal that day carries a parsed
   range**; a partial sum would read as a genuine low-calorie day.
-- **× 8 body signals** — energy, steps, sleep, resting HR, HRV, weight,
+- **8 body signals** — energy, steps, sleep, resting HR, HRV, weight,
   active energy, workout minutes.
-- **× 2 lags** — same day and next day.
+- **An allowlist of 14 pairings**, not the 48-way cross-product — see
+  `PAIRINGS` in `candidates.ts`. Each is tested at **both lags** (same day,
+  next day), so ~28 hypotheses.
 
-For each of the ~96 pairings with **≥ 4 paired days** (`MIN_PAIR_DAYS`),
-it computes Spearman ρ and a two-tailed **permutation p-value** (2000
-seeded shuffles — deterministic, and no t-distribution assumption at n=6).
-Then **Benjamini–Hochberg at q = 0.10** across the whole set.
+For each pairing with **≥ 4 paired days** (`MIN_PAIR_DAYS`), it computes
+Spearman ρ and a two-tailed **permutation p-value** (10,000 seeded
+shuffles — deterministic, no t-distribution assumption at n=6, and a floor
+of 0.0001 so values near the threshold are actually resolvable). Then
+**Benjamini–Hochberg at q = 0.10** across the whole set.
 
-That correction is not optional decoration. Testing ~96 associations
+That correction is not optional decoration. Testing this many associations
 against 30 days of one person's data manufactures a "significant" finding
 most nights; without it the app would confidently surface noise, which is
 the one thing it exists not to do. At n=4 the smallest attainable p is
 ~0.083, so thin data almost never survives — the statistics enforce the
 floor rather than the prompt asking nicely.
+
+**Why the allowlist rather than every pairing.** Each extra hypothesis
+tightens the threshold for all the others, so testing meal count against
+weight does not merely add noise — it buries the findings that matter.
+Measured against the full cross-product, a *deterministic* late-dinner
+effect surfaced in only 5 of 20 synthetic windows; the allowlist raised
+that to 7 with the false-positive rate still at 0/20. The cross-product
+also made the bar depend on how much HealthKit data someone had synced —
+more signals meant more hypotheses meant a stricter threshold, so
+connecting a scale made every *other* finding harder to surface. **Adding
+a pairing is cheap for you and expensive for every other pairing.** Add
+one only when there is a reason to expect a relationship.
 
 **Only the stronger lag survives per (feature, signal) pairing.** When
 someone's routine has any periodicity — alternating late and early
@@ -92,7 +107,15 @@ associated with the same signal at *both* lags, in opposite directions.
 Both are real; surfacing both reads as the app contradicting itself
 ("later dinners give you more energy today and less tomorrow"). The
 collapse happens **after** the BH correction, not before: correcting for
-~48 tests when we looked at ~96 would under-count what was tested.
+~14 tests when we looked at ~28 would under-count what was tested.
+
+**On q.** Loosening to 0.15 or 0.20 raises detection (9/20 and 11/20 at
+deterministic effect) but costs the zero-false-positive property (1/20
+noise windows produce a finding at both). That is the one trade this app
+cannot make — a false positive means telling someone an invented thing
+about their own body. Detection is limited by having ~26 paired days, not
+by the threshold; the lever that would actually move it is a longer
+`WINDOW_DAYS`, which is a product decision, not a statistical one.
 
 The survivors are then ranked by |ρ|, capped at **20**, and given ids
 (`c1`, `c2`, …) plus a **median split** into lower/higher groups so the
