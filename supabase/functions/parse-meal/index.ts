@@ -51,6 +51,7 @@ import {
   parsePredictions,
   summarizeDetections,
 } from "./detection.ts";
+import { matchAnchors, matchFdcEntries, renderAnchors } from "./fdc.ts";
 
 const ANTHROPIC_MODEL = "claude-sonnet-4-6";
 
@@ -69,6 +70,17 @@ type MacroRange = {
   fat_g_high: number;
   fiber_g_low: number;
   fiber_g_high: number;
+};
+
+/// Caffeine and alcohol sit outside MacroRange deliberately. They are not
+/// macronutrients, they are anchored against a reference table rather than
+/// estimated freehand (see fdc.ts), and the insight engine reads them
+/// through time windows the macros have no equivalent of.
+type StimulantRange = {
+  caffeine_mg_low: number;
+  caffeine_mg_high: number;
+  alcohol_g_low: number;
+  alcohol_g_high: number;
 };
 
 type Cuisine =
@@ -104,7 +116,7 @@ type ParsedMeal = {
   calories_low: number;
   calories_high: number;
   items: ParsedItem[];
-} & MacroRange;
+} & MacroRange & StimulantRange;
 
 const FALLBACK = {
   fallback: {
@@ -120,6 +132,10 @@ const FALLBACK = {
     fat_g_high: null,
     fiber_g_low: null,
     fiber_g_high: null,
+    caffeine_mg_low: null,
+    caffeine_mg_high: null,
+    alcohol_g_low: null,
+    alcohol_g_high: null,
     items: [] as ParsedItem[],
   },
 };
@@ -143,6 +159,8 @@ Return EXACTLY this JSON shape, with no prose, no markdown, no code fences:
   "carbs_g_low":   integer, "carbs_g_high":   integer,
   "fat_g_low":     integer, "fat_g_high":     integer,
   "fiber_g_low":   integer, "fiber_g_high":   integer,
+  "caffeine_mg_low": integer, "caffeine_mg_high": integer,
+  "alcohol_g_low":   integer, "alcohol_g_high":   integer,
   "items": [{
     "name": string, "quantity": string | null,
     "protein_g_low": integer, "protein_g_high": integer,
@@ -157,6 +175,7 @@ Rules:
 - cuisine: one of the enum values above. Use "western" only when the dish is clearly European or American in origin. When unsure between two, pick the one that best matches the dish's native name.
 - calories_low / calories_high: integer kcal estimate for the WHOLE meal. calories_high > calories_low. Range must honor uncertainty — span at least ~25% of the midpoint (e.g. 520–680, not 600–610).
 - protein/carbs/fat/fiber _g_low/_high: integer gram estimates for the WHOLE meal, same ~25%-of-midpoint uncertainty rule. high >= low. Use 0/0 only when the nutrient is genuinely absent.
+- caffeine_mg_low / caffeine_mg_high: integer milligrams of caffeine in the WHOLE meal. alcohol_g_low / alcohol_g_high: integer grams of pure ethanol in the WHOLE meal. Use 0/0 — not a guess — when the meal plainly contains neither, which is most meals. When reference values are supplied below, base these on them and multiply by the number of servings described; do not estimate from memory. These two ranges may be tighter than 25% of the midpoint, because a standard serving is a known quantity.
 - items: 1–6 short component names with per-item macro ranges. quantity is a short string like "1 cup" or "2 slices", or null if unstated. Item macros should roughly sum to meal totals.
 - If the input is vague, still produce your best guess. Do NOT refuse.
 
@@ -229,6 +248,27 @@ function isMacroRangeOk(o: Record<string, unknown>, itemLevel: boolean): boolean
   return true;
 }
 
+/// Caffeine and alcohol are meal-level only — a per-item breakdown would be
+/// noise, since these come from one identifiable component or none.
+///
+/// Unlike the macros these are required and must be non-negative: "no
+/// caffeine" has to be an explicit 0, not an omission. The insight engine
+/// distinguishes a parsed zero from an unparsed null (see the anyParsed
+/// guard in candidates.ts), and letting the model omit the field would make
+/// every meal it forgot look like an unparsed one.
+function isStimulantRangeOk(o: Record<string, unknown>): boolean {
+  const pairs: [string, string][] = [
+    ["caffeine_mg_low", "caffeine_mg_high"],
+    ["alcohol_g_low", "alcohol_g_high"],
+  ];
+  for (const [lo, hi] of pairs) {
+    if (!Number.isInteger(o[lo]) || !Number.isInteger(o[hi])) return false;
+    if ((o[lo] as number) < 0) return false;
+    if ((o[hi] as number) < (o[lo] as number)) return false;
+  }
+  return true;
+}
+
 function isCuisine(x: unknown): x is Cuisine {
   return typeof x === "string" && (CUISINE_VALUES as string[]).includes(x);
 }
@@ -243,6 +283,7 @@ function isParsedMeal(x: unknown): x is ParsedMeal {
   const hi = o.calories_high as number;
   if (lo <= 0 || hi <= lo) return false;
   if (!isMacroRangeOk(o, false)) return false;
+  if (!isStimulantRangeOk(o)) return false;
   if (!Array.isArray(o.items)) return false;
   for (const it of o.items as unknown[]) {
     if (!it || typeof it !== "object") return false;
@@ -350,6 +391,26 @@ function buildUserMessage(
         ctx.aliasLines.join("\n"),
     );
   }
+  // Reference values for any caffeinated or alcoholic item named in the
+  // transcript. Matched here, before the single Claude call, rather than
+  // against the parsed item names — those do not exist yet, and looking them
+  // up afterwards would cost a second round trip on the logging path.
+  const anchorBlock = renderAnchors(matchAnchors(transcript));
+  if (anchorBlock.length > 0) blocks.push(anchorBlock);
+
+  // Supplementary per-100g composition, when the committed FDC extract has
+  // anything relevant. Absent by default — see fdc.ts.
+  const fdcMatches = matchFdcEntries(transcript);
+  if (fdcMatches.length > 0) {
+    blocks.push(
+      "USDA FoodData Central composition per 100 g, for reference:\n" +
+        fdcMatches.map((e) =>
+          `- ${e.description}: ` +
+          Object.entries(e.per_100g).map(([k, v]) => `${k} ${v}`).join(", ")
+        ).join("\n"),
+    );
+  }
+
   blocks.push(`Input: ${transcript}`);
   return blocks.join("\n\n");
 }
@@ -563,6 +624,10 @@ serve(async (req) => {
       fat_g_high: parsed.fat_g_high,
       fiber_g_low: parsed.fiber_g_low,
       fiber_g_high: parsed.fiber_g_high,
+      caffeine_mg_low: parsed.caffeine_mg_low,
+      caffeine_mg_high: parsed.caffeine_mg_high,
+      alcohol_g_low: parsed.alcohol_g_low,
+      alcohol_g_high: parsed.alcohol_g_high,
       parse_status: "parsed",
       parsed_at: new Date().toISOString(),
       ...(detectionRecord ? { detections: detectionRecord } : {}),

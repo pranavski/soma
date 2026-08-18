@@ -1,0 +1,9 @@
+{
+  "source": "USDA FoodData Central (SR Legacy + Foundation Foods), public domain",
+  "source_url": "https://fdc.nal.usda.gov/",
+  "generated_by": "scripts/build-fdc-reference.ts",
+  "generated_at": null,
+  "units": "per 100 g as consumed; kcal, protein_g, fiber_g, caffeine_mg, alcohol_g",
+  "completed_terms": [],
+  "entries": []
+}
