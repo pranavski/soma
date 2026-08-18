@@ -26,6 +26,12 @@ function meal(over: Partial<MealRow>): MealRow {
     calories_high: null,
     protein_g_low: null,
     protein_g_high: null,
+    fiber_g_low: null,
+    fiber_g_high: null,
+    caffeine_mg_low: null,
+    caffeine_mg_high: null,
+    alcohol_g_low: null,
+    alcohol_g_high: null,
     ...over,
   };
 }

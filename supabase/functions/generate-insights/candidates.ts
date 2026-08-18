@@ -15,6 +15,13 @@
 // claims can be traced back to a row here by candidate id.
 
 import { type CheckinRow, type HealthDayRow, type MealRow, dayOfMeal, hourOfMeal } from "./digest.ts";
+import {
+  type Agreement,
+  type EvidenceRow,
+  agreementWith,
+  evidenceFor,
+  priorWeight,
+} from "./evidence.ts";
 
 // ─── Tunables ───────────────────────────────────────────────────────────────
 
@@ -29,23 +36,47 @@ export const MIN_PAIR_DAYS = 4;
 /// exploratory, every claim ships hedged, and 0.05 over a 30-day window
 /// surfaces essentially nothing.
 ///
-/// Measured over 20 synthetic 30-day windows per cell (pure-noise windows
-/// producing any finding / windows producing a finding when a late-dinner
-/// effect is deterministic):
+/// CORRECTION (evidence-layer change). This block previously recorded
+/// "0/20 false positives" at q=0.10 and described a zero-false-positive
+/// property as the thing the app must never trade. Re-measured over 300
+/// synthetic noise windows instead of 20 (scripts/fdr-validation.ts), the
+/// real rate is:
 ///
-///   q=0.10   0/20 false   7/20 detected
-///   q=0.15   1/20 false   9/20 detected
-///   q=0.20   1/20 false  11/20 detected
+///   pure-noise windows producing at least one finding:  21/300  (7.0%)
 ///
-/// Loosening buys detection by giving up the zero-false-positive property,
-/// which is the one this app cannot trade — a false positive here means
-/// telling someone an invented thing about their own body. Detection is
-/// limited by having ~26 paired days, not by the threshold; the lever that
-/// actually moves it is a longer WINDOW_DAYS, which is a product decision.
+/// The old number was not wrong so much as unresolvable: 20 windows cannot
+/// distinguish 0% from 7%, and the first sample happened to contain no
+/// hits. There was never a zero-false-positive property to protect.
+///
+/// This is expected, not a defect. Benjamini-Hochberg controls the FALSE
+/// DISCOVERY RATE — the share of findings that are wrong — not the
+/// family-wise error rate, which is what "does a noise window produce
+/// anything" measures. At q=0.10 roughly a tenth of surfaced findings are
+/// expected to be spurious, and a ~7% chance that a given quiet month
+/// produces one is the same statement seen from the other side. Every
+/// claim ships hedged ("worth watching, not a verdict") precisely because
+/// this number is not zero and cannot be made zero.
+///
+/// What still holds: loosening q raises both rates together, and detection
+/// is limited by having ~26 paired days rather than by the threshold. The
+/// lever that actually moves detection is a longer WINDOW_DAYS (a product
+/// decision) or a well-founded prior (see weightedBenjaminiHochberg).
 export const FDR_Q = 0.10;
 
 /// Ceiling on how many candidates the model is shown. Ranked by |rho|.
 export const MAX_CANDIDATES = 20;
+
+/// Zero-inflation floor, for features that are zero on most days —
+/// evening alcohol and late caffeine especially. Requiring only that a
+/// feature take two distinct values (the existing guard) lets a column of
+/// 22 zeros and 2 drinking nights through, where Spearman is reading the
+/// gap between two ranks and the permutation test cannot tell that apart
+/// from noise.
+///
+/// Both sides need this many days: at least this many where the feature is
+/// present, and at least this many where it is absent. Below that there is
+/// no contrast to measure, only two anecdotes.
+export const MIN_VARIANT_DAYS = 3;
 
 /// Above this correlation between two features, a finding about one is a
 /// restatement of a finding about the other. When breakfast sits at a fixed
@@ -67,11 +98,37 @@ export const REDUNDANT_FEATURE_RHO = 0.7;
 /// in well under a second.
 export const PERMUTATIONS = 10_000;
 
+/// Minimum days between two runs before they count as separate evidence for
+/// the same pattern.
+///
+/// Consecutive nightly runs share 29 of their 30 days, so "it survived again
+/// tonight" is very nearly a tautology — treating that as replication would
+/// manufacture confidence out of the cron schedule. At half the window the
+/// two runs share at most half their days, which is corroboration rather
+/// than restatement. Must stay >= WINDOW_DAYS / 2 (index.ts).
+export const MIN_REPLICATION_GAP_DAYS = 15;
+
+/// Independent windows a pattern must hold across before its confidence is
+/// promoted. Counting the current run, so 2 means "held once before, at
+/// least MIN_REPLICATION_GAP_DAYS ago".
+export const MIN_REPLICATION_WINDOWS = 2;
+
+/// The two intake windows the evidence rows are actually about. 14h follows
+/// the caffeine review's modelled ~8.8h cutoff against a typical bedtime;
+/// 17h is the conventional start of evening drinking. Exported because
+/// reflections.ts describes the same two windows in prose ("caffeine after
+/// 2pm") and the description must not be able to drift from the feature.
+export const LATE_CAFFEINE_HOUR = 14;
+export const EVENING_ALCOHOL_HOUR = 17;
+
 // ─── Feature and signal definitions ─────────────────────────────────────────
 
 export type FeatureKey =
   | "total_kcal"
   | "total_protein_g"
+  | "total_fiber_g"
+  | "caffeine_mg_late"
+  | "alcohol_g_evening"
   | "first_meal_hour"
   | "last_meal_hour"
   | "eating_window_h"
@@ -90,6 +147,9 @@ export type SignalKey =
 const FEATURE_LABELS: Record<FeatureKey, string> = {
   total_kcal: "day's total calories",
   total_protein_g: "day's total protein (g)",
+  total_fiber_g: "day's total fiber (g)",
+  caffeine_mg_late: "caffeine from 2pm onward (mg)",
+  alcohol_g_evening: "alcohol from 5pm onward (g)",
   first_meal_hour: "hour of first meal",
   last_meal_hour: "hour of last meal",
   eating_window_h: "eating window (hours first to last meal)",
@@ -123,6 +183,9 @@ const SIGNAL_DECIMALS: Record<SignalKey, number> = {
 const FEATURE_DECIMALS: Record<FeatureKey, number> = {
   total_kcal: 0,
   total_protein_g: 0,
+  total_fiber_g: 0,
+  caffeine_mg_late: 0,
+  alcohol_g_evening: 1,
   first_meal_hour: 1,
   last_meal_hour: 1,
   eating_window_h: 1,
@@ -169,6 +232,19 @@ export const PAIRINGS: ReadonlyArray<readonly [FeatureKey, SignalKey]> = [
   // Protein against energy and training.
   ["total_protein_g", "energy"],
   ["total_protein_g", "workout_minutes"],
+
+  // Evidence-backed additions. Every one of these has a row in
+  // evidence.ts, read out of the source's own abstract — see that file's
+  // header for the three candidate pairings that were dropped because the
+  // literature turned out not to support them. Nothing goes in this block
+  // on a hunch: an unevidenced pairing costs the same FDR budget as an
+  // evidenced one but earns none of the prior weight back.
+  ["caffeine_mg_late", "sleep_minutes"],
+  ["alcohol_g_evening", "sleep_minutes"],
+  ["alcohol_g_evening", "resting_hr_bpm"],
+  ["alcohol_g_evening", "hrv_ms"],
+  ["alcohol_g_evening", "energy"],
+  ["total_fiber_g", "sleep_minutes"],
 ];
 
 // ─── Per-day food features ──────────────────────────────────────────────────
@@ -204,10 +280,52 @@ export function buildDayFeatures(meals: MealRow[]): Map<string, DayFeatures> {
     if (everyProtein) {
       f.total_protein_g = dayMeals.reduce((s, m) => s + (m.protein_g_low! + m.protein_g_high!) / 2, 0);
     }
+    const everyFiber = dayMeals.every((m) => m.fiber_g_low !== null && m.fiber_g_high !== null);
+    if (everyFiber) {
+      f.total_fiber_g = dayMeals.reduce((s, m) => s + (m.fiber_g_low! + m.fiber_g_high!) / 2, 0);
+    }
+
+    // Caffeine and alcohol are windowed, not daily totals: the evidence is
+    // specifically about intake late enough to still be on board at
+    // bedtime. 14h follows the caffeine review's modelled 8.8h cutoff for a
+    // cup of coffee against a typical bedtime; 17h is the conventional
+    // start of evening drinking.
+    //
+    // Unlike the totals above, a missing value counts as zero rather than
+    // voiding the day. The asymmetry is deliberate: an unparsed meal could
+    // hide any number of calories, but the overwhelming majority of meals
+    // genuinely contain no caffeine and no alcohol, so requiring every meal
+    // to carry an explicit 0 would throw away nearly every day. What we do
+    // require is that the day had SOME parsed nutrition, so that a day of
+    // entirely unparsed meals is not silently recorded as a sober,
+    // caffeine-free one.
+    const anyParsed = dayMeals.some((m) => m.caffeine_mg_high !== null || m.alcohol_g_high !== null);
+    if (anyParsed) {
+      f.caffeine_mg_late = sumRangeFrom(dayMeals, LATE_CAFFEINE_HOUR, (m) => [m.caffeine_mg_low, m.caffeine_mg_high]);
+      f.alcohol_g_evening = sumRangeFrom(dayMeals, EVENING_ALCOHOL_HOUR, (m) => [m.alcohol_g_low, m.alcohol_g_high]);
+    }
 
     out.set(day, f);
   }
   return out;
+}
+
+/// Midpoint sum of a nutrient range across the meals at or after `fromHour`.
+/// A null range contributes nothing — see the note on `anyParsed` above for
+/// why that is safe here and not for calories.
+function sumRangeFrom(
+  meals: MealRow[],
+  fromHour: number,
+  pick: (m: MealRow) => [number | null, number | null],
+): number {
+  let total = 0;
+  for (const m of meals) {
+    if (hourOfMeal(m) < fromHour) continue;
+    const [lo, hi] = pick(m);
+    if (lo === null || hi === null) continue;
+    total += (lo + hi) / 2;
+  }
+  return total;
 }
 
 // ─── Per-day body signals ───────────────────────────────────────────────────
@@ -270,8 +388,13 @@ function pearson(xs: number[], ys: number[]): number {
   return den === 0 ? 0 : num / den;
 }
 
+/// Clamped, because a ratio of floating-point sums can land a hair outside
+/// [-1, 1] on a perfectly monotone series, and a correlation cannot. The
+/// pattern_history row carries a `check (rho >= -1 and rho <= 1)`, so 1 +
+/// 2e-16 would cost a run its whole memory of that night.
 export function spearman(xs: number[], ys: number[]): number {
-  return pearson(rank(xs), rank(ys));
+  const rho = pearson(rank(xs), rank(ys));
+  return Math.max(-1, Math.min(1, rho));
 }
 
 /// Seeded xorshift32 — the p-values have to be identical run to run, or the
@@ -330,12 +453,119 @@ export function benjaminiHochberg(pValues: number[], q = FDR_Q): boolean[] {
   return keep;
 }
 
+export type Confidence = "low" | "medium" | "high";
+
+/// Benjamini-Hochberg with per-hypothesis prior weights (Genovese, Roeder
+/// & Wasserman 2006). Each p-value is divided by its weight before the
+/// ordinary step-up, so a hypothesis the literature already supports needs
+/// less from this person's 30 days to clear the bar, and one nobody has
+/// studied needs slightly more.
+///
+/// The FDR is still controlled at q. Two conditions make that true, and
+/// both are enforced rather than assumed:
+///
+///   1. The weights are fixed A PRIORI. They come from evidence.ts, which
+///      is a static table of published findings — nothing about the user's
+///      data can reach them. Deriving weights from the data being tested
+///      would invalidate the guarantee completely.
+///   2. The weights average 1. We normalise here rather than trusting the
+///      caller, because a table whose weights averaged 1.4 would silently
+///      be running at q=0.14 while still claiming 0.10.
+///
+/// This is what pays for the six new pairings. Measured over 300 PAIRED
+/// synthetic windows — both procedures on identical data, so the discordant
+/// counts are the real comparison (scripts/fdr-validation.ts):
+///
+///                                    unweighted -> weighted   discordant
+///   pure-noise windows with a finding    21/300 ->   24/300    +4 / -1
+///   marginal evidence-backed effect     129/300 ->  141/300   +12 / -0
+///
+/// Twelve additional true detections for three additional false positives,
+/// and not one window lost a detection. On a McNemar test the detection
+/// gain is significant (p ~ 0.0005) while the false-positive difference is
+/// not distinguishable from noise (p ~ 0.38).
+///
+/// Note the effect used is deliberately MARGINAL. A deterministic effect
+/// clears every threshold and so cannot tell two procedures apart — both
+/// find it in 14/20 windows. The prior only matters for findings sitting
+/// near the bar, which is exactly where a prior should matter.
+export function weightedBenjaminiHochberg(
+  pValues: number[],
+  weights: number[],
+  q = FDR_Q,
+): boolean[] {
+  const m = pValues.length;
+  const keep = new Array<boolean>(m).fill(false);
+  if (m === 0) return keep;
+  if (weights.length !== m) throw new Error("weights and pValues must align");
+
+  const meanWeight = weights.reduce((a, b) => a + b, 0) / m;
+  // All-zero or degenerate weights carry no information; fall back to the
+  // unweighted procedure rather than dividing by zero.
+  if (!(meanWeight > 0)) return benjaminiHochberg(pValues, q);
+
+  const adjusted = pValues.map((p, i) => {
+    const w = weights[i] / meanWeight;
+    return w > 0 ? p / w : Number.POSITIVE_INFINITY;
+  });
+  return benjaminiHochberg(adjusted, q);
+}
+
 /// Confidence is derived from the number of supporting days, never
 /// self-reported by the model. Thresholds match the insight-rules skill.
-export function confidenceForN(n: number): "low" | "medium" | "high" {
+export function confidenceForN(n: number): Confidence {
   if (n >= 8) return "high";
   if (n >= 6) return "medium";
   return "low";
+}
+
+/// Paired days are one axis of evidence; holding up in a second, largely
+/// different window is another. A pattern that cleared the FDR correction
+/// twice over windows two weeks apart has been asked the same question of
+/// mostly different data and answered the same way — that is worth a tier.
+///
+/// Promotion is capped at one tier no matter how many windows agree,
+/// because the windows are only NEARLY independent (they may share half
+/// their days), so this is corroboration and not evidence that multiplies.
+/// The day-count floor is never bypassed: replication can lift a finding
+/// from low to medium, but nothing lifts a finding that has not passed the
+/// permutation test in this window at all.
+export function confidenceFor(n: number, windows: number): Confidence {
+  const base = confidenceForN(n);
+  if (windows < MIN_REPLICATION_WINDOWS) return base;
+  return base === "low" ? "medium" : "high";
+}
+
+function daysBetween(earlier: string, later: string): number {
+  const a = Date.parse(`${earlier}T00:00:00Z`);
+  const b = Date.parse(`${later}T00:00:00Z`);
+  return Math.round((b - a) / 86_400_000);
+}
+
+/// How many earlier runs count as separate evidence, given that this run is
+/// happening on `today`.
+///
+/// Greedy from the most recent backwards: a run counts only if it is at
+/// least `gapDays` from the last run already counted (starting from today).
+/// A month of nightly runs that all found the same thing therefore counts as
+/// one or two windows, not thirty — which is the point. Returns the count of
+/// PRIOR windows; the caller adds the current one.
+export function independentPriorWindows(
+  priorRunDates: string[],
+  today: string,
+  gapDays = MIN_REPLICATION_GAP_DAYS,
+): number {
+  const newestFirst = [...new Set(priorRunDates)].sort().reverse();
+  let anchor = today;
+  let count = 0;
+  for (const d of newestFirst) {
+    // Guard against a future-dated row (clock skew) counting as separate.
+    if (daysBetween(d, anchor) >= gapDays) {
+      count++;
+      anchor = d;
+    }
+  }
+  return count;
 }
 
 // ─── Candidates ─────────────────────────────────────────────────────────────
@@ -358,7 +588,33 @@ export type Candidate = {
   pValue: number;
   low: Group;
   high: Group;
-  confidence: "low" | "medium" | "high";
+  /// Separate windows this association has now held across, counting this
+  /// run — 1 for a first sighting. See independentPriorWindows.
+  windows: number;
+  confidence: Confidence;
+  /// The published finding covering this pairing, if there is one. Joined
+  /// verbatim into the stored insight by index.ts — the model is never
+  /// given a channel through which to write or paraphrase it.
+  evidence?: EvidenceRow;
+  /// Whether this person's data points the way the literature does. Never
+  /// used to suppress a candidate; see agreementWith in evidence.ts.
+  agreement: Agreement;
+};
+
+/// One association as it was measured this run, survivor or not. Recorded in
+/// pattern_history so a later run can tell a pattern that keeps holding from
+/// one that cleared the bar once. The rejected rows are the denominator: with
+/// only survivors on file, "how often does a finding replicate" is
+/// unanswerable.
+export type TestedAssociation = {
+  patternKey: string;
+  feature: FeatureKey;
+  signal: SignalKey;
+  lagDays: 0 | 1;
+  n: number;
+  rho: number;
+  pValue: number;
+  survivedFdr: boolean;
 };
 
 function nextDay(day: string): string {
@@ -392,18 +648,59 @@ function splitGroups(pairs: { f: number; s: number }[]): { low: Group; high: Gro
   };
 }
 
+/// Whether a feature has enough days on both sides of "present" to support
+/// a comparison. Only bites on zero-inflated features: for a continuous one
+/// like total calories, every day is non-zero and the absent-side test is
+/// vacuous, so the guard passes on the `zero === 0` short-circuit.
+export function hasVariantContrast(values: number[], min = MIN_VARIANT_DAYS): boolean {
+  let zero = 0;
+  let nonZero = 0;
+  for (const v of values) {
+    if (v === 0) zero++;
+    else nonZero++;
+  }
+  // No zeros at all — a continuous feature, nothing for this guard to say.
+  if (zero === 0) return true;
+  return zero >= min && nonZero >= min;
+}
+
+/// Everything one run measured. `tested` is the full record for
+/// pattern_history; `candidates` is the shortlist the model gets.
+export type ScoredWindow = {
+  tested: TestedAssociation[];
+  candidates: Candidate[];
+};
+
 /// Test each allowlisted PAIRINGS entry at lag 0 and lag 1, keep the ones
 /// that survive the permutation test after FDR correction, collapse to one
-/// lag per pairing, and return the strongest MAX_CANDIDATES of those.
-export function buildCandidates(
+/// lag per pairing, and return the strongest MAX_CANDIDATES of those —
+/// alongside the full tested set, whether it survived or not.
+///
+/// `priorWindows` maps a pattern_key to how many earlier, non-overlapping
+/// runs it already survived (from pattern_history). It changes only the
+/// confidence tier and what the model is told; it never changes which
+/// associations are tested, their p-values, or what clears the correction.
+/// Learning here accumulates evidence — it does not lower the bar.
+export function scoreAssociations(
   meals: MealRow[],
   checkins: CheckinRow[],
   health: HealthDayRow[],
-  opts: { permutations?: number; q?: number; max?: number } = {},
-): Candidate[] {
+  opts: {
+    permutations?: number;
+    q?: number;
+    max?: number;
+    priorWindows?: Map<string, number>;
+    /// Test seam only. Production always runs weighted; this exists so the
+    /// FDR validation harness can measure the weighted and unweighted
+    /// procedures against the same synthetic windows.
+    weighted?: boolean;
+  } = {},
+): ScoredWindow {
   const permutations = opts.permutations ?? PERMUTATIONS;
   const q = opts.q ?? FDR_Q;
   const max = opts.max ?? MAX_CANDIDATES;
+  const priorWindows = opts.priorWindows ?? new Map<string, number>();
+  const weighted = opts.weighted ?? true;
 
   const features = buildDayFeatures(meals);
   const signals = buildDaySignals(checkins, health);
@@ -427,15 +724,22 @@ export function buildCandidates(
       const ss = pairs.map((p) => p.s);
       // A constant feature or signal has no association to measure.
       if (new Set(fs).size < 2 || new Set(ss).size < 2) continue;
+      // Zero-inflated features (evening alcohol, late caffeine) clear that
+      // guard on two drinking nights in a month. Require real contrast on
+      // both sides before reading anything into the correlation.
+      if (!hasVariantContrast(fs)) continue;
 
       const groups = splitGroups(pairs);
       if (groups === null) continue;
 
       const rho = spearman(fs, ss);
       const pValue = permutationP(fs, ss, rho, permutations);
+      const patternKey = `${feature}_x_${signal}_lag${lagDays}`;
+      const row = evidenceFor(feature, signal);
 
       raw.push({
-        patternKey: `${feature}_x_${signal}_lag${lagDays}`,
+        patternKey,
+        windows: 1 + (priorWindows.get(patternKey) ?? 0),
         feature,
         signal,
         featureLabel: FEATURE_LABELS[feature],
@@ -446,20 +750,59 @@ export function buildCandidates(
         pValue,
         low: groups.low,
         high: groups.high,
+        evidence: row,
+        agreement: agreementWith(row, rho, lagDays),
       });
     }
   }
 
   // Correct across every pairing we tested, including both lags. Collapsing
   // lags first would mean correcting for ~48 tests after looking at ~96.
-  const keep = benjaminiHochberg(raw.map((r) => r.pValue), q);
+  //
+  // Weighted, so the six evidence-backed pairings added alongside caffeine
+  // and alcohol do not tax the ones that were already here. The weights come
+  // from evidence.ts and cannot be influenced by this user's data — that
+  // independence is what keeps the FDR guarantee intact.
+  const keep = weighted
+    ? weightedBenjaminiHochberg(
+      raw.map((r) => r.pValue),
+      raw.map((r) => priorWeight(r.feature, r.signal, r.lagDays)),
+      q,
+    )
+    : benjaminiHochberg(raw.map((r) => r.pValue), q);
 
+  // The full record goes to pattern_history before any thinning: the lag and
+  // restatement collapses below are editorial (they stop the feed saying one
+  // thing twice), and a pattern dropped for restating a stronger one still
+  // held tonight. Forgetting that would understate its replication later.
+  const tested: TestedAssociation[] = raw.map((r, i) => ({
+    patternKey: r.patternKey,
+    feature: r.feature,
+    signal: r.signal,
+    lagDays: r.lagDays,
+    n: r.n,
+    rho: r.rho,
+    pValue: r.pValue,
+    survivedFdr: keep[i],
+  }));
+
+  // Strength first, then a published prior as the tie-break: between two
+  // equally strong associations, the one the literature already recognises
+  // is the better thing to lead with. Deliberately only a tie-break —
+  // letting evidence outrank strength would quietly demote what this
+  // person's own data says loudest, which is the wrong way round.
   const survivors = strongestLagPerPairing(raw.filter((_, i) => keep[i]))
-    .sort((a, b) => Math.abs(b.rho) - Math.abs(a.rho));
+    .sort((a, b) => {
+      const byStrength = Math.abs(b.rho) - Math.abs(a.rho);
+      if (byStrength !== 0) return byStrength;
+      return corroborationRank(a) - corroborationRank(b);
+    });
 
-  return dropRestatements(survivors, features)
+  const candidates = dropRestatements(survivors, features)
     .slice(0, max)
-    .map((r, i) => ({ ...r, id: `c${i + 1}`, confidence: confidenceForN(r.n) }));
+    .map((r, i) => ({ ...r, id: `c${i + 1}`, confidence: confidenceFor(r.n, r.windows) }));
+
+  return { tested, candidates };
 }
 
 /// How closely two food features track each other for THIS person, over the
@@ -526,6 +869,15 @@ function strongestLagPerPairing<T extends { feature: FeatureKey; signal: SignalK
   return [...best.values()];
 }
 
+/// Sort key for the corroboration tie-break: agreeing with the literature
+/// leads, no prior sits in the middle, disagreeing goes last. Ordering only —
+/// a contradicting finding is still shown, and still shown honestly.
+function corroborationRank(c: { agreement: Agreement }): number {
+  if (c.agreement === "corroborated") return 0;
+  if (c.agreement === "no_prior") return 1;
+  return 2;
+}
+
 /// Strongest association wins; ties break on p-value, then on lag so the
 /// choice is deterministic rather than dependent on enumeration order.
 function beats(a: { rho: number; pValue: number; lagDays: 0 | 1 }, b: { rho: number; pValue: number; lagDays: 0 | 1 }): boolean {
@@ -552,8 +904,38 @@ export function renderCandidates(candidates: Candidate[]): string {
       `[${c.id}] ${c.featureLabel} vs ${c.signalLabel} (${when})`,
       `n=${c.n} paired days`,
       `rho=${c.rho.toFixed(2)}`,
+      // Only when there is something to say. A "1" on every line the first
+      // month would read as a weakness rather than the absence of a bonus.
+      ...(c.windows > 1 ? [`has held across ${c.windows} separate windows`] : []),
       `lower ${c.low.n} days averaged ${round(c.low.meanFeature, fd)} -> ${round(c.low.meanSignal, sd)}`,
       `higher ${c.high.n} days averaged ${round(c.high.meanFeature, fd)} -> ${round(c.high.meanSignal, sd)}`,
+      ...renderEvidence(c),
     ].join(" | ");
   }).join("\n");
+}
+
+/// The published context for a candidate, for the model's plausibility call
+/// only. It is told what the literature found and whether this person agrees
+/// so it can judge how much care a finding needs — NOT so it can repeat any
+/// of it. The mechanism sentence and citation the reader eventually sees are
+/// joined server-side from the same evidence row, never routed through the
+/// model. See the header of evidence.ts.
+function renderEvidence(c: Candidate): string[] {
+  if (c.evidence === undefined) {
+    return ["published evidence: none for this pairing — judge it on this person's data alone"];
+  }
+  if (c.agreement === "no_prior") {
+    // A row exists, but for the other lag. Saying "corroborated" here would
+    // borrow authority the source did not lend.
+    const expected = c.evidence.expectedLag === 0 ? "same day" : "next day";
+    return [
+      `published evidence: exists for this pairing but only ${expected} (grade ${c.evidence.grade}); it says nothing about this lag`,
+    ];
+  }
+  const agreement = c.agreement === "corroborated"
+    ? "this person's data points the SAME way"
+    : "this person's data points the OPPOSITE way — say so plainly, do not split the difference";
+  return [
+    `published evidence (grade ${c.evidence.grade}): expects ${c.evidence.direction}; ${c.evidence.magnitude} [${agreement}]`,
+  ];
 }

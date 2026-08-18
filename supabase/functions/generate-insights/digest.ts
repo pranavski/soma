@@ -19,6 +19,18 @@ export type MealRow = {
   calories_high: number | null;
   protein_g_low: number | null;
   protein_g_high: number | null;
+  /// Parsed by parse-meal since the macros migration, but not read by the
+  /// insight engine until the evidence layer gave fiber a reason to be
+  /// there (see evidence.ts, fiber_x_sleep).
+  fiber_g_low: number | null;
+  fiber_g_high: number | null;
+  /// The two nutrients with the best-quantified, most timing-sensitive
+  /// effects on signals Soma already syncs. Ranges, like every other
+  /// nutrient here — "a coffee" is not a precise dose.
+  caffeine_mg_low: number | null;
+  caffeine_mg_high: number | null;
+  alcohol_g_low: number | null;
+  alcohol_g_high: number | null;
 };
 
 export type CheckinRow = { check_date: string; energy: number };
@@ -77,7 +89,7 @@ export function hourOfMeal(m: MealRow): number {
 
 // ─── Formatting ─────────────────────────────────────────────────────────────
 
-function fmtSleep(minutes: number): string {
+export function fmtSleep(minutes: number): string {
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;
   return m === 0 ? `${h}h` : `${h}h${String(m).padStart(2, "0")}m`;
@@ -91,6 +103,14 @@ function mealLabel(m: MealRow): string {
   }
   if (m.protein_g_low !== null && m.protein_g_high !== null) {
     notes.push(`~${m.protein_g_low}-${m.protein_g_high}g prot`);
+  }
+  // Only worth a line when there is actually some — "0-0mg caffeine" on
+  // every meal would crowd out the rest of the day for no information.
+  if (m.caffeine_mg_high !== null && m.caffeine_mg_high > 0) {
+    notes.push(`~${m.caffeine_mg_low ?? 0}-${m.caffeine_mg_high}mg caff`);
+  }
+  if (m.alcohol_g_high !== null && m.alcohol_g_high > 0) {
+    notes.push(`~${m.alcohol_g_low ?? 0}-${m.alcohol_g_high}g alc`);
   }
   const hh = String(hourOfMeal(m)).padStart(2, "0");
   return notes.length > 0 ? `${hh}h ${label} (${notes.join(", ")})` : `${hh}h ${label}`;

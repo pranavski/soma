@@ -9,17 +9,23 @@ import {
   FEATURE_KEYS,
   PAIRINGS,
   SIGNAL_KEYS,
+  MIN_REPLICATION_GAP_DAYS,
   benjaminiHochberg,
-  buildCandidates,
   buildDayFeatures,
   dropRestatements,
   featureSeriesRho,
   buildDaySignals,
+  confidenceFor,
   confidenceForN,
+  independentPriorWindows,
   permutationP,
   rank,
   renderCandidates,
+  scoreAssociations,
   spearman,
+  MIN_VARIANT_DAYS,
+  hasVariantContrast,
+  weightedBenjaminiHochberg,
 } from "./candidates.ts";
 
 function meal(over: Partial<MealRow>): MealRow {
@@ -33,6 +39,12 @@ function meal(over: Partial<MealRow>): MealRow {
     calories_high: null,
     protein_g_low: null,
     protein_g_high: null,
+    fiber_g_low: null,
+    fiber_g_high: null,
+    caffeine_mg_low: null,
+    caffeine_mg_high: null,
+    alcohol_g_low: null,
+    alcohol_g_high: null,
     ...over,
   };
 }
@@ -73,6 +85,18 @@ Deno.test("spearman is +1 / -1 on monotone data and ~0 on none", () => {
   assertAlmostEquals(spearman([1, 2, 3, 4], [1, 4, 90, 10000]), 1, 1e-9);
   assertAlmostEquals(spearman([1, 2, 3, 4], [40, 30, 20, 10]), -1, 1e-9);
   assertEquals(spearman([1, 1, 1, 1], [4, 2, 7, 1]), 0); // constant → no association
+});
+
+Deno.test("spearman never escapes [-1, 1] through float error", () => {
+  // pattern_history has a check constraint on rho; 1 + 2e-16 from a ratio of
+  // floating-point sums would cost a run its whole memory of that night.
+  for (let n = 4; n <= 40; n++) {
+    const xs = Array.from({ length: n }, (_, i) => i * 1.1);
+    const asc = xs.map((x) => x * 7919 + 0.3);
+    const desc = [...asc].reverse();
+    assert(spearman(xs, asc) <= 1, `n=${n} exceeded +1`);
+    assert(spearman(xs, desc) >= -1, `n=${n} exceeded -1`);
+  }
 });
 
 // ─── permutationP ───────────────────────────────────────────────────────────
@@ -175,7 +199,50 @@ Deno.test("confidenceForN matches the documented tiers", () => {
   assertEquals(confidenceForN(30), "high");
 });
 
-// ─── buildCandidates ────────────────────────────────────────────────────────
+// ─── replication ────────────────────────────────────────────────────────────
+
+Deno.test("independentPriorWindows does not count overlapping runs", () => {
+  // A pattern found every night for a fortnight is one observation seen
+  // fourteen times — consecutive 30-day windows share 29 of their days.
+  const nightly = Array.from({ length: 14 }, (_, i) => day(16 + i)); // ..to day 29
+  assertEquals(independentPriorWindows(nightly, day(30)), 0);
+});
+
+Deno.test("independentPriorWindows counts runs a gap apart, greedily", () => {
+  const today = day(60);
+  assertEquals(independentPriorWindows([day(45)], today), 1);
+  assertEquals(independentPriorWindows([day(45), day(30)], today), 2);
+  // day(50) is inside the gap from today and does not reset the anchor, so
+  // day(45) still counts from today and day(30) still counts from day(45).
+  assertEquals(independentPriorWindows([day(50), day(45), day(30)], today), 2);
+  // Exactly at the boundary counts; one day short does not.
+  assertEquals(independentPriorWindows([day(60 - MIN_REPLICATION_GAP_DAYS)], today), 1);
+  assertEquals(independentPriorWindows([day(60 - MIN_REPLICATION_GAP_DAYS + 1)], today), 0);
+  assertEquals(independentPriorWindows([], today), 0);
+});
+
+Deno.test("independentPriorWindows ignores duplicate and future run dates", () => {
+  const today = day(60);
+  assertEquals(independentPriorWindows([day(40), day(40), day(40)], today), 1);
+  // Clock skew must not manufacture a second window out of one run.
+  assertEquals(independentPriorWindows([day(70)], today), 0);
+});
+
+Deno.test("confidenceFor promotes at most one tier, and only on replication", () => {
+  // A single window is exactly the old behaviour.
+  assertEquals(confidenceFor(4, 1), confidenceForN(4));
+  assertEquals(confidenceFor(6, 1), confidenceForN(6));
+  assertEquals(confidenceFor(8, 1), confidenceForN(8));
+
+  assertEquals(confidenceFor(4, 2), "medium");
+  assertEquals(confidenceFor(6, 2), "high");
+  // Windows corroborate; they do not compound. Five agreeing windows say the
+  // same thing as two, because they are only nearly independent.
+  assertEquals(confidenceFor(4, 5), "medium");
+  assertEquals(confidenceFor(8, 9), "high");
+});
+
+// ─── scoreAssociations ──────────────────────────────────────────────────────
 
 /// 20 days where a later last meal goes with lower energy the NEXT day,
 /// and nothing else is correlated with anything.
@@ -192,9 +259,9 @@ function plantedWindow(): { meals: MealRow[]; checkins: CheckinRow[]; health: He
   return { meals, checkins, health: [] };
 }
 
-Deno.test("buildCandidates finds a planted association and scores it", () => {
+Deno.test("scoreAssociations finds a planted association and scores it", () => {
   const { meals, checkins, health } = plantedWindow();
-  const cands = buildCandidates(meals, checkins, health);
+  const cands = scoreAssociations(meals, checkins, health).candidates;
 
   const hit = cands.find((c) => c.patternKey === "last_meal_hour_x_energy_lag1");
   assert(hit !== undefined, "planted last-meal-hour → next-day energy not found");
@@ -222,21 +289,21 @@ Deno.test("PAIRINGS is an allowlist, not the cross-product", () => {
   }
 });
 
-Deno.test("buildCandidates never returns a pairing outside the allowlist", () => {
+Deno.test("scoreAssociations never returns a pairing outside the allowlist", () => {
   const { meals, checkins, health } = plantedWindow();
   const allowed = new Set(PAIRINGS.map(([f, s]) => `${f}_x_${s}`));
-  for (const c of buildCandidates(meals, checkins, health)) {
+  for (const c of scoreAssociations(meals, checkins, health).candidates) {
     assert(allowed.has(`${c.feature}_x_${c.signal}`), `${c.patternKey} is not allowlisted`);
   }
 });
 
-Deno.test("buildCandidates keeps only the stronger lag per feature/signal pairing", () => {
+Deno.test("scoreAssociations keeps only the stronger lag per feature/signal pairing", () => {
   // plantedWindow alternates dinner time every day, so same-day energy is
   // necessarily anti-correlated with same-day dinner hour while next-day
   // energy is correlated with it. Both associations are real; surfacing
   // both would read as the app contradicting itself.
   const { meals, checkins, health } = plantedWindow();
-  const cands = buildCandidates(meals, checkins, health);
+  const cands = scoreAssociations(meals, checkins, health).candidates;
 
   const pairings = cands.map((c) => `${c.feature}_x_${c.signal}`);
   assertEquals(pairings.length, new Set(pairings).size, "a pairing appeared at both lags");
@@ -302,20 +369,20 @@ Deno.test("dropRestatements keeps the strongest of a restating group", () => {
   );
 });
 
-Deno.test("buildCandidates does not surface a feature that restates a stronger one", () => {
+Deno.test("scoreAssociations does not surface a feature that restates a stronger one", () => {
   // plantedWindow holds breakfast at 08h, so eating window and last-meal
   // hour are the same fact. Only one may reach the feed.
   const { meals, checkins, health } = plantedWindow();
-  const againstEnergy = buildCandidates(meals, checkins, health)
+  const againstEnergy = scoreAssociations(meals, checkins, health).candidates
     .filter((c) => c.signal === "energy")
     .map((c) => c.feature);
   const timing = againstEnergy.filter((f) => f === "last_meal_hour" || f === "eating_window_h");
   assertEquals(timing.length, 1, `both timing features surfaced: ${againstEnergy.join(", ")}`);
 });
 
-Deno.test("buildCandidates assigns contiguous ids ranked by |rho|", () => {
+Deno.test("scoreAssociations assigns contiguous ids ranked by |rho|", () => {
   const { meals, checkins, health } = plantedWindow();
-  const cands = buildCandidates(meals, checkins, health);
+  const cands = scoreAssociations(meals, checkins, health).candidates;
   assert(cands.length > 0);
   assertEquals(cands.map((c) => c.id), cands.map((_, i) => `c${i + 1}`));
   for (let i = 1; i < cands.length; i++) {
@@ -336,9 +403,8 @@ function makeRng(seed: number): () => number {
   };
 }
 
-Deno.test("buildCandidates finds nothing in pure noise", () => {
-  // ~100 associations tested against 30 days of unrelated data. Without the
-  // FDR correction this is where the engine would invent a finding a night.
+/// 30 days where nothing is related to anything.
+function noiseWindow(): { meals: MealRow[]; checkins: CheckinRow[]; health: HealthDayRow[] } {
   const rng = makeRng(0xC0FFEE);
   const meals: MealRow[] = [];
   const checkins: CheckinRow[] = [];
@@ -354,10 +420,78 @@ Deno.test("buildCandidates finds nothing in pure noise", () => {
       resting_hr_bpm: 55 + Math.floor(rng() * 12),
     }));
   }
-  assertEquals(buildCandidates(meals, checkins, health), []);
+  return { meals, checkins, health };
+}
+
+Deno.test("scoreAssociations finds nothing in pure noise", () => {
+  // ~100 associations tested against 30 days of unrelated data. Without the
+  // FDR correction this is where the engine would invent a finding a night.
+  const { meals, checkins, health } = noiseWindow();
+  assertEquals(scoreAssociations(meals, checkins, health).candidates, []);
 });
 
-Deno.test("buildCandidates skips pairings below MIN_PAIR_DAYS", () => {
+// ─── the tested record (pattern_history) ────────────────────────────────────
+
+Deno.test("scoreAssociations reports every association it tested, rejects included", () => {
+  // A night that surfaces nothing still measured ~28 things, and those
+  // rejections are what a replication rate is later measured against.
+  const noise = noiseWindow();
+  const { tested, candidates } = scoreAssociations(noise.meals, noise.checkins, noise.health);
+  assertEquals(candidates, []);
+  assert(tested.length > 0, "a run that found nothing still tested something");
+  assertFalse(tested.some((t) => t.survivedFdr));
+
+  const keys = tested.map((t) => t.patternKey);
+  assertEquals(keys.length, new Set(keys).size, "one row per pattern per run");
+  for (const t of tested) {
+    assertEquals(t.patternKey, `${t.feature}_x_${t.signal}_lag${t.lagDays}`);
+    assert(t.n >= 4 && t.pValue > 0 && t.pValue <= 1, JSON.stringify(t));
+  }
+});
+
+Deno.test("the tested record keeps a pattern the shortlist drops for restating another", () => {
+  // plantedWindow fixes breakfast at 08h, so eating window restates dinner
+  // hour and one of them never reaches the model. It still held tonight, and
+  // forgetting that would understate its replication later.
+  const { meals, checkins, health } = plantedWindow();
+  const { tested, candidates } = scoreAssociations(meals, checkins, health);
+
+  const surfaced = new Set(candidates.map((c) => c.patternKey));
+  const survived = tested.filter((t) => t.survivedFdr).map((t) => t.patternKey);
+  assert(
+    survived.some((k) => !surfaced.has(k)),
+    "expected a survivor thinned out of the shortlist",
+  );
+  for (const key of surfaced) assert(survived.includes(key), `${key} surfaced without surviving`);
+});
+
+Deno.test("prior windows change confidence and copy, never the statistics", () => {
+  const { meals, checkins, health } = plantedWindow();
+  const planted = "last_meal_hour_x_energy_lag1";
+
+  const first = scoreAssociations(meals, checkins, health);
+  const replicated = scoreAssociations(meals, checkins, health, {
+    priorWindows: new Map([[planted, 2]]),
+  });
+
+  // Same data, same numbers. Replication is allowed to raise a tier and to
+  // inform the model's choice; it may never move a p-value or let something
+  // through the correction that would not have passed on its own.
+  assertEquals(replicated.tested, first.tested);
+  assertEquals(
+    replicated.candidates.map((c) => [c.patternKey, c.n, c.rho, c.pValue]),
+    first.candidates.map((c) => [c.patternKey, c.n, c.rho, c.pValue]),
+  );
+
+  assertEquals(first.candidates.find((c) => c.patternKey === planted)!.windows, 1);
+  assertEquals(replicated.candidates.find((c) => c.patternKey === planted)!.windows, 3);
+  // Unmentioned patterns stay first sightings.
+  for (const c of replicated.candidates) {
+    if (c.patternKey !== planted) assertEquals(c.windows, 1);
+  }
+});
+
+Deno.test("scoreAssociations skips pairings below MIN_PAIR_DAYS", () => {
   // Three days of data cannot produce any candidate, however clean.
   const meals: MealRow[] = [];
   const checkins: CheckinRow[] = [];
@@ -365,10 +499,10 @@ Deno.test("buildCandidates skips pairings below MIN_PAIR_DAYS", () => {
     meals.push(meal({ eaten_date: day(i), eaten_hour: 18 + i }));
     checkins.push({ check_date: day(i), energy: 5 - i });
   }
-  assertEquals(buildCandidates(meals, checkins, []), []);
+  assertEquals(scoreAssociations(meals, checkins, []).candidates, []);
 });
 
-Deno.test("buildCandidates ignores a constant signal", () => {
+Deno.test("scoreAssociations ignores a constant signal", () => {
   // Energy pinned at 3 every day — no association exists to find.
   const meals: MealRow[] = [];
   const checkins: CheckinRow[] = [];
@@ -376,14 +510,14 @@ Deno.test("buildCandidates ignores a constant signal", () => {
     meals.push(meal({ eaten_date: day(i), eaten_hour: 17 + (i % 6) }));
     checkins.push({ check_date: day(i), energy: 3 });
   }
-  assertFalse(buildCandidates(meals, checkins, []).some((c) => c.signal === "energy"));
+  assertFalse(scoreAssociations(meals, checkins, []).candidates.some((c) => c.signal === "energy"));
 });
 
 // ─── renderCandidates ───────────────────────────────────────────────────────
 
 Deno.test("renderCandidates gives the model pre-rounded numbers to quote", () => {
   const { meals, checkins, health } = plantedWindow();
-  const cands = buildCandidates(meals, checkins, health);
+  const cands = scoreAssociations(meals, checkins, health).candidates;
   const line = renderCandidates(cands).split("\n")
     .find((l) => l.includes("hour of last meal") && l.includes("next day"))!;
 
@@ -395,4 +529,86 @@ Deno.test("renderCandidates gives the model pre-rounded numbers to quote", () =>
   // Energy is rendered to one decimal, steps to none — the model quotes
   // these verbatim, so the rounding has to happen here.
   assert(/-> \d+\.\d(?: |$)/.test(line), line);
+});
+
+Deno.test("renderCandidates mentions replication only when there is some", () => {
+  const { meals, checkins, health } = plantedWindow();
+  const planted = "last_meal_hour_x_energy_lag1";
+
+  // A first sighting says nothing about windows — "1 window" on every line
+  // for a new user's whole first month would read as a weakness.
+  const first = scoreAssociations(meals, checkins, health).candidates;
+  assertFalse(renderCandidates(first).includes("separate windows"));
+
+  const replicated = scoreAssociations(meals, checkins, health, {
+    priorWindows: new Map([[planted, 2]]),
+  }).candidates;
+  const line = renderCandidates(replicated).split("\n")
+    .find((l) => l.includes("hour of last meal") && l.includes("next day"))!;
+  assert(line.includes("has held across 3 separate windows"), line);
+});
+
+// ─── weighted Benjamini-Hochberg ────────────────────────────────────────────
+
+Deno.test("weightedBenjaminiHochberg with equal weights is plain BH", () => {
+  const ps = [0.001, 0.02, 0.04, 0.3, 0.7];
+  const flat = new Array(ps.length).fill(1);
+  assertEquals(weightedBenjaminiHochberg(ps, flat), benjaminiHochberg(ps));
+  // Any constant weight, not just 1 — normalisation divides it out.
+  assertEquals(weightedBenjaminiHochberg(ps, new Array(ps.length).fill(7)), benjaminiHochberg(ps));
+});
+
+Deno.test("weightedBenjaminiHochberg normalises weights to mean 1", () => {
+  // A table whose weights all exceeded 1 must NOT silently run at a looser
+  // q. If normalisation were skipped, every hypothesis here would clear a
+  // threshold 3x wider than the one the caller asked for.
+  const ps = [0.03, 0.2, 0.5];
+  const inflated = [3, 3, 3];
+  assertEquals(weightedBenjaminiHochberg(ps, inflated), benjaminiHochberg(ps));
+});
+
+Deno.test("weight moves a hypothesis across the threshold, in both directions", () => {
+  // p=0.04 sits just outside plain BH at q=0.10 with 3 hypotheses.
+  const ps = [0.04, 0.6, 0.9];
+  assertFalse(benjaminiHochberg(ps)[0]);
+  // Prioritised: now clears.
+  assert(weightedBenjaminiHochberg(ps, [2.0, 0.5, 0.5])[0]);
+  // Deprioritised: the borderline one is pushed further out.
+  assertFalse(weightedBenjaminiHochberg(ps, [0.5, 1.75, 1.75])[0]);
+});
+
+Deno.test("weightedBenjaminiHochberg is defensive about degenerate input", () => {
+  assertEquals(weightedBenjaminiHochberg([], []), []);
+  // All-zero weights carry no information — fall back rather than divide by 0.
+  const ps = [0.001, 0.5];
+  assertEquals(weightedBenjaminiHochberg(ps, [0, 0]), benjaminiHochberg(ps));
+});
+
+Deno.test("weightedBenjaminiHochberg rejects misaligned weights", () => {
+  let threw = false;
+  try {
+    weightedBenjaminiHochberg([0.1, 0.2], [1]);
+  } catch {
+    threw = true;
+  }
+  assert(threw, "a weights/pValues length mismatch must fail loudly, not silently mis-weight");
+});
+
+// ─── zero-inflation guard ───────────────────────────────────────────────────
+
+Deno.test("hasVariantContrast ignores continuous features", () => {
+  // No zeros at all — the guard has nothing to say about total calories.
+  assert(hasVariantContrast([1800, 2200, 1950, 2400]));
+});
+
+Deno.test("hasVariantContrast requires real contrast on both sides", () => {
+  const zeros = new Array(22).fill(0);
+  // Two drinking nights in a month: two distinct values, but nothing to
+  // compare. This is the case the plain "at least 2 distinct values" guard
+  // let through.
+  assertFalse(hasVariantContrast([...zeros, 14, 20]));
+  assert(hasVariantContrast([...zeros, 14, 20, 18]));
+  assertEquals(MIN_VARIANT_DAYS, 3);
+  // And the mirror image: mostly non-zero with too few zero days.
+  assertFalse(hasVariantContrast([0, 0, 12, 14, 16, 18, 20, 22]));
 });
