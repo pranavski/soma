@@ -1,16 +1,26 @@
 # Soma — App Store Compliance Map (v1.0 submission)
 
-_Last audited: 2026-08-02, against the App Store Review Guidelines as
+_Last audited: 2026-09-07, against the App Store Review Guidelines as
 updated 2025-11-13 (the "third-party AI" revision of 5.1.2(i)) and the
 2025 expanded age-rating system._
 
+> **2026-09-07 pre-submission audit.** Walked the app the way App Review
+> does (fresh account, deny everything, decline consent, delete). One real
+> defect found and fixed: the third-party-AI consent lived only in
+> UserDefaults, so the nightly `generate-insights` job — which runs
+> server-side for every user with a recent meal — sent *declined* users'
+> meals, check-ins and daily health totals to Anthropic anyway. There is
+> now an `ai_consent` table the app writes, the function checks, and the
+> cron filters on. The medical-advice line, the consent sheet and the
+> privacy policy are all in the build; the stale CODE items below that
+> said otherwise are closed. What remains is App Store Connect, hosting
+> and secrets — see §6.
+>
 > **2026-08-02 remediation pass.** The five code-side blockers from the
-> 2026-07-19 audit are now closed: the app icon exists, the privacy policy
+> 2026-07-19 audit are closed: the app icon exists, the privacy policy
 > is in the app, third-party AI has a named pre-first-use consent gate that
 > also gates the code path, photo logging is flagged off, and the speech
-> purpose string matches the code. What remains is App Store Connect and
-> hosting work, marked **ASC** / **LEGAL** below — no code change can close
-> those. See §6 for the current state.
+> purpose string matches the code.
 
 This is a living checklist. Statuses:
 
@@ -115,21 +125,25 @@ Status:
 
 - [x] Anthropic is named in the privacy policy with purpose and
   no-training note
-- [ ] **CODE** — Add an **in-app, pre-first-use disclosure with explicit
-  consent**. There is currently no onboarding/consent surface and no
-  mention of Claude/Anthropic anywhere in the app UI. Minimum viable:
-  a one-time sheet after first sign-in (or before the first meal parse):
-  "Soma sends what you say or type about a meal to Anthropic's Claude to
-  turn it into a structured entry. Nothing else — no health data, no
-  identity — is included. [privacy policy link] — OK / Not now", with
-  "Not now" leaving manual/typed logging functional or clearly gating
-  parse. Persist the acceptance
-- [ ] **CODE or product decision** — `generate-insights` sends
-  HealthKit-derived deltas to Claude. Safest fix: use deterministic
-  template copy for the four v1 rules and drop the Claude call (the stats
-  are already computed rule-side); otherwise the disclosure and privacy
-  policy must say health-derived aggregates reach Anthropic, which
-  interacts badly with 5.1.3 (below)
+- [x] **CODE** — In-app, pre-first-use disclosure with explicit consent:
+  `AIDisclosureSheet` (names "Claude — an AI model made by Anthropic",
+  itemised sent/never list, real decline). Shown once after sign-in,
+  before any meal can be logged; `MealLogger` files a declined user's meal
+  as written and never calls `parse-meal`
+- [x] **CODE** — The disclosure and both copies of the policy describe
+  **both** uses: meal text for parsing, and the nightly digest of meals,
+  check-ins and the seven daily Apple Health totals. (The alternative —
+  template copy, no model in the health path — was considered and not
+  taken; the engine's value is the model choosing what to say)
+- [x] **CODE (2026-09-07)** — Consent is enforced **server-side**.
+  `ai_consent` (migration `20260907140000`) holds one row per user;
+  `AIDisclosure` upserts it on accept/decline and re-pushes on sign-in;
+  `generate-insights` returns `no_ai_consent` without calling the model
+  unless the row says yes for the current version; the cron fan-out only
+  enqueues consented users. Before this, the client-only flag meant a
+  decline stopped parsing but not the nightly send
+- [x] Consent revocable in-app (kitchen → Reading meals) and reset on
+  sign-out so the next account on the phone is asked afresh
 
 ### 5.1.2(vi) + 5.1.3(i) — HealthKit data restrictions
 
@@ -143,12 +157,12 @@ improve health management (with permission) or for health research.
   daily aggregate numbers per day (`health_days` table). Background
   delivery does not widen this: a background wakeup runs the same
   on-device rollup as a foreground one (`HealthKitSync`)
-- [ ] **CODE (same item as above)** — the `generate-insights` → Claude call
-  transmits HealthKit-*derived* statistics to a third party. It is arguably
-  within the "improving health management" exception and carries no user
-  identifier, but it contradicts the privacy policy's "meal text only"
-  claim and is exactly the pattern the Nov-2025 AI revision targets.
-  Recommendation: template copy, no Claude call for insights
+- [x] **CODE** — The `generate-insights` → Claude call transmits
+  HealthKit-*derived* daily totals to a third party. This is disclosed by
+  name in the consent sheet and the policy, carries no user identifier,
+  sits inside the "improving health management" exception, and — as of
+  2026-09-07 — cannot happen for anyone who has not said yes (server-side
+  `ai_consent` check). Say this plainly in Review Notes
 - [x] The app discloses which health data types it reads — all seven:
   steps, sleep, resting HR, HRV, weight, active energy, workouts. The
   purpose string, `HealthKitSheet` and the privacy policy list the same
@@ -179,10 +193,11 @@ medical decisions."
   ranges ("~550–700"), insights hedged and non-prescriptive ("worth
   watching, not a verdict") — this is the single best defense against
   medical classification
-- [ ] **CODE** — Add a short "not medical advice" line in a visible spot
-  (Insights empty state footer and/or About sheet), e.g.: "Soma shows
-  patterns in your own logs. It isn't medical advice — talk to a doctor
-  about health decisions." Cheap insurance against a 1.4.1 reading
+- [x] **CODE** — "not medical advice. soma surfaces patterns, not
+  diagnoses. talk to a clinician for anything that matters." is on the
+  Insights screen (`InsightsView`), in the kitchen (`SettingsView`), and
+  the sign-in screen says "by signing in you accept that this isn't
+  medical advice." The About sheet and the in-app policy repeat it
 - [ ] **ASC** — App Store description: never use "track your health,"
   "improve your metabolism," "lose weight," or any outcome claim.
   Describe it as a food journal that shows patterns
@@ -256,9 +271,18 @@ therapeutic claims.
   empty tracking domains, four collected data types, four accessed-API
   categories (see §3 for full review)
 - [x] Supabase Swift SDK: not on Apple's "SDKs that require a privacy
-  manifest and signature" list; supabase-swift ships its own
-  `PrivacyInfo.xcprivacy` bundle (verify it's present in the resolved
-  package at archive time)
+  manifest and signature" list. **The resolved 2.47.0 checkout ships no
+  `PrivacyInfo.xcprivacy`** (checked 2026-09-07 — the earlier claim that
+  it did was wrong), so the app manifest has to cover its API use. Hand
+  reconciliation of every resolved package (supabase-swift, swift-crypto,
+  swift-asn1, swift-clocks, swift-concurrency-extras, swift-http-types,
+  xctest-dynamic-overlay): the only required-reason-adjacent call is
+  `attributesOfItem(atPath:)[.size]` in supabase-swift's
+  `MultipartFormData` — file size, not a timestamp, so no category.
+  swift-crypto carries its own (empty) manifests. The app itself uses
+  UserDefaults only. `FileTimestamp`, `DiskSpace` and `SystemBootTime` in
+  the app manifest are therefore over-declared; harmless, and left in
+  because Foundation/URLSession internals can trip the archive scanner
 - [ ] **CODE (verify)** — At archive time, generate the **privacy report**
   (Xcode Organizer → archive → Generate Privacy Report) and confirm the
   aggregate manifest matches §2's nutrition-label draft; fix any
@@ -379,35 +403,36 @@ user's language; never overstate.
 
 ---
 
-## 5. Risks / likely rejection reasons (ranked)
+## 5. Risks / likely rejection reasons (ranked, 2026-09-07)
 
-1. **Third-party AI without in-app consent — 5.1.2(i), Nov 2025 text.**
-   Meal text goes to Anthropic with no in-app disclosure or permission
-   flow. This is the exact pattern the
-   revision targets and the most probable rejection. Fix: named, explicit,
-   pre-first-parse consent sheet + policy accuracy.
-2. **Privacy policy inaccuracies.** "Anthropic gets meal text only" is
-   contradicted by `generate-insights` (health-derived stats). Reviewers
-   diff app behavior against the policy; inaccurate policies fail
-   5.1.1(i). Fix policy or fix behavior (template insight copy).
-3. **No in-app privacy policy link.** Hard requirement of 5.1.1(i);
-   currently absent from Settings/About. One `Link` row fixes it.
-4. **Health-derived data reaching a third-party AI — 5.1.3(i) optics.**
-   Even de-identified deltas invite the "health data shared with AI"
-   reading during review of a HealthKit app. Cheapest de-risk: generate
-   insight copy from templates, keep Claude out of the health path
-   entirely, and say so proudly in Review Notes.
-5. **Non-functional account deletion at review time.** If the `APPLE_*`
-   secrets aren't configured, token revocation silently no-ops; reviewers
-   do test deletion on SIWA apps (5.1.1(v)). Also blockers of the boring
-   kind: missing app icon (cannot archive), unhosted policy URL, and the
-   speech purpose-string/on-device mismatch (metadata dishonesty reads
-   badly in an otherwise privacy-forward app).
+1. **2.1 "Information Needed" — the reviewer cannot see an insight.** The
+   engine needs ~10 paired days; a fresh account shows "keep logging". Login
+   is Sign in with Apple only, so there is no demo account to hand over.
+   Mitigation: `docs/reviewer-seed.sql` seeds thirty days for any user id,
+   Review Notes explain the gate, and a short screen recording is attached
+   to the submission. This is now the most probable rejection.
+2. **5.1.1(v) non-functional account deletion.** If the four `APPLE_*`
+   secrets are unset, token revocation silently no-ops and a second sign-in
+   comes back without name/email. Set them and run smoke-test step 5.
+3. **5.1.1(i) privacy policy URL.** `SomaFeatures.privacyPolicyURL` points
+   at a domain we do not own until GitHub Pages is live. Ship with the flag
+   false if hosting slips — the in-app sheet carries the full text — but the
+   ASC field itself is mandatory and must resolve.
+4. **1.4.1 medical framing in metadata.** The app is clean; the description,
+   subtitle and screenshots are what could still attract it. §1 lists the
+   banned phrases.
+5. **Backend not deployed.** Two migrations and four functions are pending.
+   An undeployed `generate-insights` turns pull-to-refresh into an error in
+   the reviewer's hands.
 
-Secondary watch items: 1.4.1 medical framing in App Store copy (keep
-"journal/patterns", add the not-medical-advice line); age-rating
-questionnaire "medical or wellness" answer; never add CloudKit sync for
-`health_days` (5.1.3(ii)); if Google login ever appears, 4.8 re-triggers.
+Closed since the 2026-08-02 ranking: in-app AI consent (now also enforced
+server-side), policy accuracy, in-app policy link, medical-advice line,
+speech purpose string, app icon.
+
+Secondary watch items: age-rating "medical or wellness" answer; never add
+CloudKit sync for `health_days` (5.1.3(ii)); if Google login ever appears,
+4.8 re-triggers; supabase-swift has no privacy manifest of its own, so any
+new required-reason API it adopts lands on the app manifest.
 
 ---
 
@@ -426,7 +451,7 @@ questionnaire "medical or wellness" answer; never add CloudKit sync for
 
 ---
 
-## 6. Remediation status — 2026-08-02
+## 6. Remediation status — 2026-09-07
 
 ### Closed in code
 
@@ -440,6 +465,8 @@ questionnaire "medical or wellness" answer; never add CloudKit sync for
 | Speech purpose string claimed on-device; code never set it | `SpeechCapture` sets `requiresOnDeviceRecognition` where supported, and the purpose string was softened to stay true where it isn't |
 | App icon missing — cannot archive | `DesignAssets/master/app-icon-1024.png` + `build-assets.sh`, which crops the master's transparent margin and flattens it; a flattened RGB 1024 PNG is wired into the appiconset and verified present in the built bundle |
 | HealthKit "connected" flag survived sign-out, so a second account on the same phone auto-synced health data | `HealthKitSync.clearConnected()` + `stopObserving()` on sign-out |
+| Consent enforced only on the phone; the nightly cron sent declined users' data to Anthropic anyway (found 2026-09-07) | `ai_consent` table + `AIConsentRepository`; `generate-insights` checks it before any model call; the cron fan-out joins on it |
+| Consent sheet listed five daily totals; the digest carries seven | Sheet now names active energy and workout minutes too |
 | No in-app way to stop HealthKit syncing — 5.1.1(v) expects the user to be able to withdraw what they granted | "disconnect" in `HealthKitSheet` stops observers and background delivery; copy states that already-synced summaries remain until account deletion |
 
 ### Still open — not closeable in code
@@ -462,17 +489,11 @@ questionnaire "medical or wellness" answer; never add CloudKit sync for
   reconcile with §3. `OtherDiagnosticData` is correctly declared: feedback
   rows store app version and iOS version (`FeedbackRepository`)
 
-### Recommended, not done — needs a product decision
+### Done 2026-09-07 — the product decision above
 
-The nightly `generate-insights` digest sends HealthKit-derived daily values
-to Anthropic. This is now honestly disclosed and consented, which satisfies
-5.1.2(i), but 5.1.3(i) optics are still better if health data never reaches
-a third-party AI at all. Two options, both out of scope for a bug-fix pass:
-
-1. Keep Claude for meal parsing only; generate insight copy from templates
-   over rule-computed stats. Strongest position, loses the LLM's ability to
-   find un-predeclared correlations — i.e. the point of the current engine.
-2. Keep the engine, but have `generate-insights` read a per-user opt-in
-   column and skip health rows for users who decline. Needs a migration plus
-   an Edge Function change; the nightly cron runs server-side, so a
-   client-only flag cannot enforce it.
+Option 2 from the earlier note is what shipped: `generate-insights` reads
+the per-user `ai_consent` row and skips the model entirely for anyone who
+declined, and the cron never enqueues them. Option 1 (template copy, no
+model in the health path) remains available if App Review pushes on
+5.1.3(i) despite the disclosure; it would be a `generate-insights`-only
+change.

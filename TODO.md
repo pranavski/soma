@@ -5,8 +5,10 @@ broken has been fixed in code; what remains is hosting, App Store Connect
 and deploy steps that need a human with credentials.
 
 ## Before the next TestFlight build
-- [ ] `supabase db push` — two migrations (insights read-only for clients,
-      `insight_runs`), then `supabase migration list` to confirm.
+- [ ] `supabase db push` — three migrations (insights read-only for clients,
+      `insight_runs`, `ai_consent`), then `supabase migration list` to confirm.
+      Until `ai_consent` is live, the deployed `generate-insights` treats
+      everyone as declined.
 - [ ] `supabase functions deploy generate-insights submit-correction delete-account`
       (`parse-meal` is deployed separately with menu awareness).
 - [ ] Confirm the four `APPLE_*` secrets are set, or SIWA token revocation
@@ -14,7 +16,14 @@ and deploy steps that need a human with credentials.
 - [ ] Host `docs/privacy-policy.md` (GitHub Pages), set
       `SomaFeatures.privacyPolicyURL`, flip `privacyPolicyIsHosted`.
 - [ ] App Store Connect: privacy URL, support URL, nutrition label, age
-      rating, review notes, screenshots — docs/app-store-compliance.md §6.
+      rating, review notes, screenshots — paste from
+      docs/app-store-connect-copy.md; status in docs/app-store-compliance.md §6.
+- [ ] Enable GitHub Pages (Settings → Pages → Source: GitHub Actions) so
+      `.github/workflows/pages.yml` publishes the policy. The repo is
+      private: Pages from a private repo needs a paid GitHub plan, else
+      make the repo public or move the policy to a public one.
+- [ ] Seed a reviewer-visible insight with docs/reviewer-seed.sql, record a
+      short video, attach it to the submission.
 
 ## Nice to have, not blocking
 - [ ] `scripts/build-fdc-reference.ts` has never been run to completion;
@@ -27,6 +36,7 @@ and deploy steps that need a human with credentials.
 - [ ] Meal plans — design note only (docs/meal-plans-design.md), no code.
 
 ## Done (kept for the record)
+- AI consent enforced server-side (`ai_consent`), not just on the phone.
 - Voice / typed meal → pending row → Claude parse → Today card.
 - Declined AI consent files the meal as written, correction open.
 - Corrections rewrite meal_items; corrected rows repeatable and re-correctable.

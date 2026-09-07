@@ -10,11 +10,13 @@ supabase migration list   # local and remote columns must match
 supabase db push
 ```
 
-Pushes whatever is unapplied. As of 2026-09-07 that is the two newest
+Pushes whatever is unapplied. As of 2026-09-07 that is the three newest
 migrations: `20260907120000_insights_read_only_for_clients.sql` (drops the
-client write policies on `insights`) and
-`20260907120100_create_insight_runs.sql` (the per-user throttle table
-`generate-insights` reads). Verify:
+client write policies on `insights`), `20260907120100_create_insight_runs.sql`
+(the per-user throttle table `generate-insights` reads) and
+`20260907140000_create_ai_consent.sql` (the server-side consent row the
+function and the cron fan-out check — without it no user gets nightly
+insights, which is the safe direction). Verify:
 
 ```sh
 supabase db diff        # should be empty
@@ -92,6 +94,11 @@ Dashboard → Authentication → Providers → Apple:
   from the master PNG.
 - Screenshots: iPhone only (the target is iPhone-only, portrait-only).
   Do not show or mention photo logging — it is not in this version.
+- **Copy and review notes** — drafted in `docs/app-store-connect-copy.md`;
+  paste from there.
+- **Reviewer can't see an insight** — the engine needs ~10 paired days.
+  Run `docs/reviewer-seed.sql` against your own account before the
+  screenshots and the review video (see that file's header).
 
 ## 7. Xcode / signing sanity
 
@@ -114,7 +121,13 @@ Dashboard → Authentication → Providers → Apple:
 6. Pull to refresh on the Noticed tab twice in a row: the second pull
    should show "thought it over a few minutes ago" (the 429 throttle),
    not a failure.
-7. Invoke `generate-insights` manually with the cron secret and confirm the
+7. Consent, server-side: on an account that tapped "not now", confirm
+   `select * from ai_consent where user_id = '<uuid>'` shows
+   `consented = false`, then run step 8's curl for that user — expect
+   `{"surfaced":false,"reason":"no_ai_consent",...}` and no row in
+   `insight_runs` with a model call behind it. Flip consent on in the
+   kitchen → Reading meals and re-run: the reason changes.
+8. Invoke `generate-insights` manually with the cron secret and confirm the
    insufficient-data / insight / empty-state responses behave per spec:
    ```sh
    curl -X POST https://<ref>.supabase.co/functions/v1/generate-insights \
