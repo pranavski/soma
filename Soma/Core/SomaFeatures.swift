@@ -11,12 +11,13 @@ enum SomaFeatures {
     /// carries the full text as well, so the requirement is met even before
     /// this resolves.
     ///
-    /// PLACEHOLDER — nothing is served here yet. The sheet only renders the
-    /// "read on the web" link while `privacyPolicyIsHosted` is true, so a
-    /// reviewer never taps through to a dead page. When the policy is
-    /// published (GitHub Pages is the plan), point this at it and flip the
-    /// flag. Tracked in docs/app-store-compliance.md §6.
-    static let privacyPolicyURL = URL(string: "https://soma.app/privacy")
+    /// Served by `.github/workflows/pages.yml` once Pages is enabled on the
+    /// repo (Settings → Pages → Source: GitHub Actions). The sheet only
+    /// renders the "read on the web" link while `privacyPolicyIsHosted` is
+    /// true, so a reviewer never taps through to a dead page. Open this URL
+    /// in a browser, then flip the flag. Tracked in
+    /// docs/app-store-compliance.md §6.
+    static let privacyPolicyURL = URL(string: "https://pranavski.github.io/soma/privacy/")
 
     /// Flip to true once `privacyPolicyURL` actually resolves.
     static let privacyPolicyIsHosted = false
