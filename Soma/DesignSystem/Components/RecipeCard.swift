@@ -17,6 +17,9 @@ struct RecipeCard: View {
     let dishName: String
     let calorieRange: String?
     let macros: MacroBreakdown?
+    /// One more ticket line under the macros — caffeine and alcohol, when
+    /// the meal carries either. Nil for most meals.
+    let detail: String?
     let aside: String?
     let glyph: FoodGlyph
 
@@ -25,6 +28,7 @@ struct RecipeCard: View {
         dishName: String,
         calorieRange: String?,
         macros: MacroBreakdown? = nil,
+        detail: String? = nil,
         aside: String?,
         glyph: FoodGlyph
     ) {
@@ -32,6 +36,7 @@ struct RecipeCard: View {
         self.dishName = dishName
         self.calorieRange = calorieRange
         self.macros = macros
+        self.detail = detail
         self.aside = aside
         self.glyph = glyph
     }
@@ -75,6 +80,14 @@ struct RecipeCard: View {
 
             if let macros, !macros.isEmpty {
                 MacroStrip(macros: macros)
+                    .padding(.top, 4)
+            }
+
+            if let detail, !detail.isEmpty {
+                Text(detail)
+                    .font(Font.Soma.caloric)
+                    .foregroundStyle(Color.inkSoft)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 4)
             }
 

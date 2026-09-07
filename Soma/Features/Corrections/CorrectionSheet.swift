@@ -3,6 +3,10 @@ import SwiftUI
 /// "Not quite right?" — the per-meal correction sheet, opened from the
 /// meal-detail long-press affordance on a RecipeCard.
 ///
+/// It opens on any row that isn't mid-parse: Claude's guess, a failed
+/// parse (blank fields), a meal filed with consent off (the person's
+/// words as the dish, no range yet), and a meal already corrected once.
+///
 /// Behavioral rules:
 ///   * Calorie range is edited as low + high, both required, high >= low.
 ///     We enforce the spec's "always a range" contract here rather than
@@ -281,10 +285,14 @@ struct CorrectionSheet: View {
             calories_high: Int(caloriesHighText) ?? 0,
             items: items
         )
-        let original = MealCorrectionOriginal(
-            dish_name: meal.dishName,
-            cuisine: meal.cuisine
-        )
+        // Only a dish Claude named is an "original guess" worth learning
+        // an alias from. A manual row's name is the person's own — a
+        // correction of it, or a meal filed with consent off — and teaching
+        // the community table "their words → their words" would just be
+        // noise in every future parse prompt.
+        let original: MealCorrectionOriginal? = meal.dishWasParsed
+            ? MealCorrectionOriginal(dish_name: meal.dishName, cuisine: meal.cuisine)
+            : nil
 
         do {
             try await repository.submit(

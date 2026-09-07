@@ -228,6 +228,7 @@ private struct CardStream: View {
                     dishName: meal.displayName,
                     calorieRange: meal.calorieRange,
                     macros: meal.macros,
+                    detail: meal.stimulantNote,
                     aside: meal.isRepeat ? "a familiar one" : nil,
                     glyph: FoodGlyph.from(meal.displayName)
                 )
@@ -239,11 +240,13 @@ private struct CardStream: View {
                             .padding(Theme.Spacing.m)
                     }
                 }
-                // "Not quite right?" — bottom-right of every card that has
-                // an AI-derived guess. Hidden while parsing and on
-                // manually-entered rows since there's nothing to correct.
+                // "Not quite right?" — bottom-right of every card except one
+                // still parsing. That covers the AI's guess, a failed parse,
+                // a meal filed with consent off (nothing but the person's
+                // words), and a meal corrected once already. Same gate as
+                // `MealCardActions.canCorrect`.
                 .overlay(alignment: .bottomTrailing) {
-                    if meal.parseStatus == .parsed || meal.parseStatus == .failed {
+                    if meal.parseStatus != .pending {
                         Button {
                             onCorrect(meal)
                         } label: {

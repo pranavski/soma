@@ -12,8 +12,10 @@ import SwiftUI
 ///
 /// So `parse-meal` — which posts what the user typed or said to Claude — is
 /// gated on `hasConsented`. Declining leaves logging fully usable: the meal is
-/// still saved, it just stays unparsed until the user changes their mind, and
-/// the correction sheet can fill in the details by hand.
+/// filed as written — a `manual` row titled with the person's own words, no
+/// estimate — and the correction sheet fills in the details by hand. (See
+/// `MealLogger.log`; a `pending` row would spin forever with nothing coming
+/// to finish it.)
 ///
 /// **The storage key is versioned on purpose.** Consent is to a described
 /// flow, not to a vendor in the abstract, so when what leaves the phone

@@ -227,6 +227,7 @@ private struct DayCardStack: View {
                             dishName: meal.displayName,
                             calorieRange: meal.calorieRange,
                             macros: meal.macros,
+                            detail: meal.stimulantNote,
                             aside: meal.isRepeat ? "a familiar one" : nil,
                             glyph: FoodGlyph.from(meal.displayName)
                         )

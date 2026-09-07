@@ -47,6 +47,26 @@ struct MealLogger {
         eatenAt: Date,
         onInserted: () async -> Void
     ) async throws -> Receipt {
+        // Guideline 5.1.2(i): no personal data reaches Anthropic without
+        // explicit consent. With consent off the meal is filed as written —
+        // a `manual` row titled with the person's own words, no spinner, and
+        // "not quite right?" open from the start to fill in the rest. A
+        // `pending` row here would spin forever, because nothing is coming
+        // to finish it.
+        guard disclosure.hasConsented else {
+            let mealId = try await repository.insertWrittenMeal(
+                transcript: transcript,
+                source: source,
+                eatenAt: eatenAt
+            )
+            await onInserted()
+            return Receipt(
+                mealId: mealId,
+                note: "filed as written — soma won't send it to Claude until you say it's ok, see the kitchen. press and hold the card to fill in the details.",
+                parseAttempted: false
+            )
+        }
+
         let mealId = try await repository.insertPendingMeal(
             source: source,
             voiceTranscript: transcript,
@@ -54,17 +74,6 @@ struct MealLogger {
         )
 
         await onInserted()
-
-        // Guideline 5.1.2(i): no personal data reaches Anthropic without
-        // explicit consent. The meal is already saved — it simply stays
-        // unparsed, and the card's "not quite right?" sheet fills it in.
-        guard disclosure.hasConsented else {
-            return Receipt(
-                mealId: mealId,
-                note: "saved. soma won't send it to Claude to be read until you say it's ok — see the kitchen.",
-                parseAttempted: false
-            )
-        }
 
         struct ParseRequest: Encodable {
             let meal_id: UUID

@@ -40,7 +40,7 @@ struct AIConsentSettingsSheet: View {
                         .lineSpacing(3)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Text("with it off, meals still save — they just stay unparsed, and you can fill in the details yourself with “not quite right?” on any card.")
+                    Text("with it off, meals still save — filed as you wrote them, no estimate. fill in the details yourself with “not quite right?” on any card.")
                         .font(Font.Soma.dishNote)
                         .foregroundStyle(Color.inkSoft)
                         .lineSpacing(3)

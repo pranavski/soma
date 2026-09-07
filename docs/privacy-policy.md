@@ -100,9 +100,9 @@ In every case:
 Anthropic processes this data as a service provider under its commercial
 terms and does not use it to train models.
 
-If you decline, Soma keeps working: meals still save, they simply stay
-unparsed, and you can fill in the details yourself with "not quite right?"
-on any card.
+If you decline, Soma keeps working: meals still save, filed exactly as you
+wrote them with no estimate attached, and you can fill in the details
+yourself with "not quite right?" on any card.
 
 ## Insights
 

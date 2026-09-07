@@ -22,10 +22,12 @@ struct MealCardActions: ViewModifier {
     var onDeleteRequest: (Meal) -> Void
 
     /// Nothing to correct while a row is still parsing — the guess it
-    /// would pre-fill doesn't exist yet. Same gate the Today card's
-    /// "not quite right?" chip uses.
+    /// would pre-fill doesn't exist yet. Every other row is open: a parse,
+    /// a failed parse, a meal filed with consent off, and a meal already
+    /// corrected once — a slip in a correction has to be fixable too. Same
+    /// gate the Today card's "not quite right?" chip uses.
     private var canCorrect: Bool {
-        onCorrect != nil && (meal.parseStatus == .parsed || meal.parseStatus == .failed)
+        onCorrect != nil && meal.parseStatus != .pending
     }
 
     func body(content: Content) -> some View {

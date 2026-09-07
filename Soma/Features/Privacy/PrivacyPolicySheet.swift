@@ -87,7 +87,7 @@ struct PrivacyPolicySheet: View {
         ),
         Section(
             title: "third-party AI — Anthropic's Claude",
-            text: "two things go to Claude, from soma's server rather than your phone, and only after you've agreed. first: the text of a meal you log, so it can be parsed into a structured entry. second: once a night, a compact summary of your recent meals, energy check-ins and daily health totals, so it can look for patterns. no name, no email, no account id, no raw health samples, and no audio. nothing travels past Anthropic. Anthropic processes this as a service provider and does not train models on it. you can withdraw consent in the kitchen at any time — logging keeps working, meals just stay unparsed."
+            text: "two things go to Claude, from soma's server rather than your phone, and only after you've agreed. first: the text of a meal you log, so it can be parsed into a structured entry. second: once a night, a compact summary of your recent meals, energy check-ins and daily health totals, so it can look for patterns. no name, no email, no account id, no raw health samples, and no audio. nothing travels past Anthropic. Anthropic processes this as a service provider and does not train models on it. you can withdraw consent in the kitchen at any time — logging keeps working — meals are filed as you wrote them, and you fill in the details yourself."
         ),
         Section(
             title: "insights",

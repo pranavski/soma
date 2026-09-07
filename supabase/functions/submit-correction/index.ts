@@ -2,8 +2,9 @@
 //
 // Receives a confirmed correction from the meal-detail "not quite right?"
 // sheet, writes it to `meal_corrections` (owner-scoped, RLS-enforced),
-// and updates the community-shared `dish_aliases` table with the newly
-// learned (canonical, alias) pair.
+// updates the community-shared `dish_aliases` table with the newly
+// learned (canonical, alias) pair, and rewrites the meal row and its
+// `meal_items` so the correction is what the person sees from then on.
 //
 // Contract (request):
 //   {
@@ -248,6 +249,35 @@ serve(async (req) => {
       })
       .eq("id", mealId)
       .eq("user_id", userId);
+
+    // 4) The components too. The sheet pre-fills "what was in it" from
+    //    meal_items and lets the person add and remove — if the edited list
+    //    only ever lands in the archive, reopening the sheet shows Claude's
+    //    original list again and the edit looks lost. Replace wholesale:
+    //    the corrected list is the whole truth of what was in the meal.
+    //    Per-item macro ranges are not carried (the sheet doesn't edit
+    //    them), so the replaced rows have name, quantity and position only.
+    const { error: clearErr } = await admin
+      .from("meal_items")
+      .delete()
+      .eq("meal_id", mealId)
+      .eq("user_id", userId);
+    if (clearErr) {
+      console.error(`submit-correction: meal_items clear failed — ${clearErr.message}`);
+    } else if (corrected.items.length > 0) {
+      const { error: itemsErr } = await admin.from("meal_items").insert(
+        corrected.items.map((it, i) => ({
+          meal_id: mealId,
+          user_id: userId,
+          name: it.name,
+          quantity: it.quantity,
+          position: i,
+        })),
+      );
+      if (itemsErr) {
+        console.error(`submit-correction: meal_items write failed — ${itemsErr.message}`);
+      }
+    }
   }
 
   return json(200, { id: inserted.id });

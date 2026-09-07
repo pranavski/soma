@@ -29,6 +29,14 @@ struct Meal: Identifiable, Hashable, Codable {
     // Raw string (not the Cuisine enum) so an unrecognized server value
     // can't fail the whole row decode.
     var cuisine: String? = nil
+    // Caffeine (mg) and alcohol (g of ethanol) — meal-level, anchored by
+    // parse-meal against reference servings. The insight engine reads them,
+    // so the card shows them too; a finding about afternoon coffee should
+    // never be the first time the user sees soma record caffeine.
+    var caffeineMgLow: Int? = nil
+    var caffeineMgHigh: Int? = nil
+    var alcoholGLow: Int? = nil
+    var alcoholGHigh: Int? = nil
 
     enum Source: String, Codable, Hashable {
         case photo, voice, manual
@@ -61,6 +69,10 @@ struct Meal: Identifiable, Hashable, Codable {
         case voiceTranscript = "voice_transcript"
         case parseStatus     = "parse_status"
         case cuisine
+        case caffeineMgLow   = "caffeine_mg_low"
+        case caffeineMgHigh  = "caffeine_mg_high"
+        case alcoholGLow     = "alcohol_g_low"
+        case alcoholGHigh    = "alcohol_g_high"
     }
 }
 
@@ -90,6 +102,29 @@ extension Meal {
     /// Macro ranges rendered as "~lo–hi g" strings, nil when unparsed.
     /// Follows the calorie-range contract exactly.
     var macros: MacroBreakdown { MacroBreakdown(meal: self) }
+
+    /// "~80–120 mg caffeine · ~14–20 g alcohol" for a meal that carries
+    /// either; nil when both are zero or unparsed, which is most meals.
+    /// Ranges, like everything else on the card.
+    var stimulantNote: String? {
+        var parts: [String] = []
+        if let lo = caffeineMgLow, let hi = caffeineMgHigh, hi > 0 {
+            parts.append("~\(lo)–\(hi) mg caffeine")
+        }
+        if let lo = alcoholGLow, let hi = alcoholGHigh, hi > 0 {
+            parts.append("~\(lo)–\(hi) g alcohol")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// True when the dish on the row came from Claude rather than from the
+    /// person — the only case where a correction has an "original guess"
+    /// worth teaching the community alias table from. A `manual` row's name
+    /// is human-written (a correction, or a meal filed with consent off), so
+    /// there is nothing there to learn a mapping from.
+    var dishWasParsed: Bool {
+        parseStatus == .parsed || parseStatus == .failed
+    }
 }
 
 /// Per-macro range strings for the parsed meal. A field returns nil if
