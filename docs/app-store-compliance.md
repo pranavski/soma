@@ -43,15 +43,16 @@ to revoke consent.
 
 - [x] Policy text written — `docs/privacy-policy.md` covers meals, HealthKit
   aggregates-only sync, Supabase, Anthropic, deletion, export
-- [ ] **LEGAL** — Host the policy at a stable public URL (any static page)
-- [ ] **ASC** — Set the Privacy Policy URL in App Store Connect
-- [ ] **CODE** — Add a privacy-policy link inside the app. There is currently
-  **no** link anywhere in Settings/About (`AboutSheet.swift` has none). A
-  `Link` row in `SettingsView`/`AboutSheet` is sufficient
-- [ ] **LEGAL** — Fix policy accuracy gaps before hosting:
-  - It says Anthropic receives "meal text only". Not true:
-    `generate-insights` sends HealthKit-derived correlation stats
-    (RHR/HRV deltas, day counts) to Claude for copy generation
+- [ ] **LEGAL** — Host the policy at a stable public URL. Plan: GitHub
+  Pages from `docs/privacy-policy.md`. Then set `SomaFeatures.privacyPolicyURL`
+  and flip `SomaFeatures.privacyPolicyIsHosted` so the in-app "read on the
+  web" link appears (it is hidden until then, so no reviewer taps a dead page)
+- [ ] **ASC** — Set the Privacy Policy URL and Support URL in App Store
+  Connect. Support email is `SomaFeatures.supportEmail` (the policy's contact)
+- [x] **CODE** — Privacy policy reachable in-app: full text in
+  `PrivacyPolicySheet`, linked from the sign-in screen and the kitchen (§6)
+- [x] **LEGAL** — Policy accuracy: the policy now states that the nightly
+  digest (meals, check-ins, daily health totals) goes to Claude (§6)
 
 ### 5.1.1 — Consent, purpose strings, data minimization
 
@@ -148,8 +149,11 @@ improve health management (with permission) or for health research.
   identifier, but it contradicts the privacy policy's "meal text only"
   claim and is exactly the pattern the Nov-2025 AI revision targets.
   Recommendation: template copy, no Claude call for insights
-- [x] The app discloses which health data types it reads (purpose string
-  lists steps, sleep, resting HR, HRV; `HealthKitSheet` in Settings)
+- [x] The app discloses which health data types it reads — all seven:
+  steps, sleep, resting HR, HRV, weight, active energy, workouts. The
+  purpose string, `HealthKitSheet` and the privacy policy list the same
+  set as `HealthKitAggregator.sampleTypes` requests (fixed 2026-09-07; the
+  string and sheet used to name only four)
 
 ### 5.1.3(ii) — No false HealthKit writes; no health data in iCloud
 
@@ -282,15 +286,10 @@ The expanded questionnaire (mandatory for all submissions since
 - [x] Audio is never stored or uploaded — only the transcript is sent to
   `parse-meal`. So the nutrition label needs "Other User Content" (the
   transcript), **not** "Audio Data"
-- [ ] **CODE** — **Mismatch:** the purpose string claims "on-device speech
-  recognition", but `SpeechCapture.swift` never sets
-  `request.requiresOnDeviceRecognition = true`, so iOS may route audio
-  through Apple's servers. Pick one:
-  - (a) set `requiresOnDeviceRecognition = true` when
-    `recognizer.supportsOnDeviceRecognition` (keeps the string honest;
-    slightly lower accuracy), or
-  - (b) soften the string (drop "on-device") — see §4 draft.
-  A purpose string that overstates privacy is a rejection/metadata risk
+- [x] **CODE** — Purpose string and code agree: `SpeechCapture` sets
+  `requiresOnDeviceRecognition` wherever the device supports it, and the
+  string says "on device wherever your iPhone supports it" (§6). The
+  recogniser follows the device locale, falling back to en-US
 
 ### Camera / photos
 
@@ -302,8 +301,8 @@ The expanded questionnaire (mandatory for all submissions since
 
 ### Other submission blockers (from repo state)
 
-- [ ] **CODE** — App icon: `Assets.xcassets` appiconset is empty; Xcode
-  will refuse to archive for distribution without the 1024pt icon
+- [x] **CODE** — App icon present (`DesignAssets/build-assets.sh` drops
+  the flattened 1024pt icon into the appiconset)
 - [x] iPhone-only, portrait-only, iOS 17+ — set in project
 - [ ] **ASC** — Screenshots (iPhone only), subtitle, keywords, support URL
   (required alongside the privacy policy URL)
@@ -372,11 +371,11 @@ user's language; never overstate.
 
 | Key | Current | Verdict |
 |---|---|---|
-| `NSHealthShareUsageDescription` | "Soma reads steps, sleep, resting heart rate, and HRV so it can look for gentle correlations with how you're eating and feeling. Reads only — nothing is written back." | Keep. Names the exact types, states the purpose, states read-only |
+| `NSHealthShareUsageDescription` | "Soma reads steps, sleep, resting heart rate, HRV, weight, active energy and workouts so it can look for gentle correlations with how you're eating and feeling. Reads only — nothing is written back." | Keep. Names all seven types the aggregator requests, states the purpose, states read-only |
 | `NSHealthUpdateUsageDescription` | "Soma does not write to HealthKit." | Keep (key must exist for some SDK paths; honest) |
 | `NSMicrophoneUsageDescription` | "Soma listens only while you tap the speak button, to turn what you say into a meal entry." | Keep |
-| `NSSpeechRecognitionUsageDescription` | "Soma uses on-device speech recognition to turn spoken meals into text." | **Fix.** Code does not force on-device recognition. Either set `requiresOnDeviceRecognition` in `SpeechCapture` or replace with: "Soma turns what you say into meal text. Recognition may use Apple's speech service; Soma never stores or uploads the audio." |
-| `NSCameraUsageDescription` | "Soma uses the camera only when you snap a meal photo, to turn it into a meal entry." | Keep if photos ship; harmless if the feature is flagged off |
+| `NSSpeechRecognitionUsageDescription` | "Soma turns what you say into meal text, on device wherever your iPhone supports it. Soma never stores or uploads the audio." | Keep. `SpeechCapture` forces on-device recognition where supported, so the qualifier is true |
+| `NSCameraUsageDescription` | — (removed with photo logging) | Add back only if photos ship |
 
 ---
 
@@ -445,9 +444,12 @@ questionnaire "medical or wellness" answer; never add CloudKit sync for
 
 ### Still open — not closeable in code
 
-- [ ] **LEGAL** — Host `docs/privacy-policy.md` and point
-  `SomaFeatures.privacyPolicyURL` at it (currently a placeholder)
-- [ ] **ASC** — Privacy Policy URL + Support URL in App Store Connect
+- [ ] **LEGAL** — Host `docs/privacy-policy.md` (GitHub Pages), point
+  `SomaFeatures.privacyPolicyURL` at it and set `privacyPolicyIsHosted`
+  to true. Until then the in-app web link is hidden and the sheet carries
+  the full text
+- [ ] **ASC** — Privacy Policy URL + Support URL in App Store Connect;
+  support contact is `SomaFeatures.supportEmail`
 - [ ] **ASC** — Set the four `APPLE_*` secrets in Supabase or SIWA token
   revocation silently no-ops during deletion (see deployment checklist §2)
 - [ ] **ASC** — Nutrition label per §2. "Photos or Videos" is **not**

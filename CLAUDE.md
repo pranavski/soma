@@ -34,7 +34,14 @@ insight-rules (any insight engine work).
 - Xcode: no xcodebuild MCP server is configured — use `xcodebuild`
   directly. After EVERY Swift change: build, fix errors, then run on the
   iPhone 16 simulator and check logs before reporting done.
-- github MCP: one PR per phase, conventional commits
+- No GitHub MCP either — use `gh`. One PR per phase, conventional commits.
+- CI: `.github/workflows/ci.yml` runs the Deno tests and the iOS build +
+  unit tests on every push and PR.
+
+## Working conventions
+- Ship-time constants (privacy URL, support email) live in
+  `Soma/Core/SomaFeatures.swift`; `TODO.md` and `docs/deployment-checklist.md`
+  are the live status lists — keep them current when finishing work.
 
 ## Hard rules
 - Calories are ALWAYS ranges in UI copy ("~550–700"), never bare numbers
