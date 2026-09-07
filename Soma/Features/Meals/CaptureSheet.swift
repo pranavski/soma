@@ -25,6 +25,8 @@ struct CaptureSheet: View {
 
     @StateObject private var speech = SpeechCapture()
     @State private var typed: String = ""
+    /// Optional. Where the food came from, when it wasn't this kitchen.
+    @State private var place: String = ""
     @FocusState private var typedFocused: Bool
 
     /// `day` names the day this ticket files against — today from the Today
@@ -60,6 +62,17 @@ struct CaptureSheet: View {
         !Calendar.current.isDate(eatenAt, inSameDayAs: now)
     }
 
+    /// The transcript as parse-meal receives it. A place typed into the
+    /// "where" field is folded in as the words the person would otherwise
+    /// have said ("… from starbucks"), so the same gate reads both, and the
+    /// saved transcript still shows where the food came from.
+    static func compose(_ text: String, from place: String) -> String {
+        let meal = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let venue = place.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !meal.isEmpty, !venue.isEmpty else { return meal }
+        return "\(meal), from \(venue)"
+    }
+
     var body: some View {
         ZStack {
             PaperBackground()
@@ -88,6 +101,8 @@ struct CaptureSheet: View {
                 whenRow
 
                 transcriptField
+
+                whereRow
 
                 if let err = speech.errorText {
                     Text(err)
@@ -143,6 +158,32 @@ struct CaptureSheet: View {
                     .foregroundStyle(Color.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    /// "where — [ starbucks ]". Optional, and empty for most meals: it is
+    /// there so a grilled cheese from Starbucks is never priced as a grilled
+    /// cheese from In-N-Out, or from this kitchen. Saying the place out loud
+    /// ("… from starbucks") works just as well; this is for the people who
+    /// won't think to.
+    private var whereRow: some View {
+        HStack(spacing: Theme.Spacing.s) {
+            Text("where —")
+                .font(Font.Soma.margin)
+                .foregroundStyle(Color.inkSoft)
+
+            TextField("starbucks, in-n-out, a clif bar", text: $place)
+                .font(Font.Soma.dishSmall)
+                .foregroundStyle(Color.ink)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.done)
+                .padding(.horizontal, Theme.Spacing.m)
+                .padding(.vertical, 8)
+                .background(
+                    Capsule(style: .continuous)
+                        .stroke(Color.rule, lineWidth: 0.6)
+                )
         }
     }
 
@@ -213,7 +254,8 @@ struct CaptureSheet: View {
                 // The picker is bounded, but a sheet left open across the
                 // minute it was opened in can still hand back a "now" that
                 // has since become the past-tense kind of future.
-                onSubmit(payload, fromVoice ? .voice : .manual,
+                onSubmit(Self.compose(payload, from: place),
+                         fromVoice ? .voice : .manual,
                          MealEntryWindow.clamp(eatenAt))
             } label: {
                 Text("send")

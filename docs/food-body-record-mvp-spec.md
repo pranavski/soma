@@ -282,6 +282,26 @@ calls Claude (`claude-sonnet-4-6`) with the structured-output contract
 below, then **updates the `meals` row** and inserts `meal_items` rows
 using the service role.
 
+**Menu awareness.** A deterministic gate (`parse-meal/venue.ts`) checks the
+transcript for a restaurant, chain, packaged brand, or a `from X` / `at X`
+phrase. On a hit, and only then, the prompt gains a block naming the
+operator and telling Claude to treat the item as that operator's product:
+base the figures on the published menu it knows, build the items from what
+that kitchen actually puts in it, and keep the operator in `dish_name`
+("grilled cheese from starbucks") so it never collapses into another
+kitchen's version in the repeat chips, `dish_aliases`, or the repeat-dish
+insight rule. A chain whose figures the model knows may carry a range
+tighter than the 25% rule — a menu item is a standardized quantity, the
+same reasoning as the caffeine anchors in `fdc.ts`. A place it does not
+know is estimated at restaurant portion and preparation at the normal
+width; the prompt forbids narrowing on a menu it can't actually recall.
+
+This is prompt context only: no tool, no search, no recipient beyond
+Anthropic, so it sits inside the existing consent. The capture sheet has
+an optional "where —" field that folds into the transcript as
+"…, from <place>", so the gate reads a typed place and a spoken one the
+same way. Home cooking, which is most meals, never gets the block.
+
 **Claude output contract** (strict JSON, validated server-side):
 ```json
 {

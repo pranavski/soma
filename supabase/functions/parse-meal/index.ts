@@ -18,6 +18,14 @@
 // to the user (via RLS on meal_corrections) while sharing benign
 // canonical-name → alias mappings across the community (dish_aliases).
 //
+// Menu-aware: when the transcript names a restaurant, chain, or packaged
+// brand (see venue.ts), the prompt tells Claude which operator's product
+// this is, so "grilled cheese from starbucks" is priced off Starbucks'
+// published item rather than a generic sandwich, and keeps the operator in
+// dish_name so it never collapses into In-N-Out's. This is prompt context
+// only — no tool, no search, nothing leaves Anthropic — and it is absent
+// for home cooking, which is most meals.
+//
 // Secrets required (set via `supabase secrets set ...`):
 //   ANTHROPIC_API_KEY
 //   SUPABASE_URL                  (auto-injected)
@@ -30,6 +38,7 @@ import {
   type SupabaseClient,
 } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { matchAnchors, matchFdcEntries, renderAnchors } from "./fdc.ts";
+import { detectVenues, renderVenueContext } from "./venue.ts";
 
 const ANTHROPIC_MODEL = "claude-sonnet-4-6";
 
@@ -389,6 +398,10 @@ function buildUserMessage(
         ).join("\n"),
     );
   }
+
+  // The operator, when the transcript named one. Absent for home cooking.
+  const venueBlock = renderVenueContext(detectVenues(transcript));
+  if (venueBlock.length > 0) blocks.push(venueBlock);
 
   blocks.push(`Input: ${transcript}`);
   return blocks.join("\n\n");
