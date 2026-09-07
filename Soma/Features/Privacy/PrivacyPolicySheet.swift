@@ -45,7 +45,9 @@ struct PrivacyPolicySheet: View {
                         PolicySection(title: section.title, text: section.text)
                     }
 
-                    if let url = SomaFeatures.privacyPolicyURL {
+                    // Hidden until the hosted copy exists — a link to a page
+                    // that isn't there is worse than no link.
+                    if SomaFeatures.privacyPolicyIsHosted, let url = SomaFeatures.privacyPolicyURL {
                         Link(destination: url) {
                             Text("read this policy on the web")
                                 .font(Font.Soma.margin)

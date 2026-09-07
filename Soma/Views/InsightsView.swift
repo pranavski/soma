@@ -74,6 +74,16 @@ struct InsightsView: View {
                         .frame(height: 6)
                         .padding(.horizontal, Theme.Spacing.xl)
 
+                    // On the screen where the claims live, not only in the
+                    // kitchen footer: once cards cite journals, the reader
+                    // has to be told here what they are not.
+                    Text("not medical advice. soma surfaces patterns, not diagnoses. talk to a clinician for anything that matters.")
+                        .font(Font.Soma.margin)
+                        .foregroundStyle(Color.inkSoft.opacity(0.85))
+                        .lineSpacing(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, Theme.Spacing.xl)
+
                     Spacer(minLength: Theme.TabBar.scrollBottomInset)
                 }
             }

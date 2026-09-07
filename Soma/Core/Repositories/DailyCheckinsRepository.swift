@@ -12,20 +12,6 @@ struct DailyCheckinsRepository {
         self.decoder = SupabaseDates.makeDecoder()
     }
 
-    /// The most recent check-in (any date) or nil. Used to decide whether
-    /// to nudge the user to log today's yet.
-    func fetchLatest() async throws -> DailyCheckin? {
-        let response = try await client
-            .from("daily_checkins")
-            .select()
-            .order("check_date", ascending: false)
-            .limit(1)
-            .execute()
-
-        let rows = try decoder.decode([DailyCheckin].self, from: response.data)
-        return rows.first
-    }
-
     /// Fetch a specific local date's check-in, if any.
     func fetch(on day: Date = Date()) async throws -> DailyCheckin? {
         let response = try await client

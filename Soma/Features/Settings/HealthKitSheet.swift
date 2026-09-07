@@ -48,7 +48,7 @@ struct HealthKitSheet: View {
                     .font(Font.Soma.dayLine)
                     .foregroundStyle(Color.ink)
 
-                Text("Soma reads steps, sleep, resting heart rate, and HRV to look for gentle correlations. Raw HealthKit samples stay on your phone — only a daily summary is stored.")
+                Text("Soma reads steps, sleep, resting heart rate, HRV, weight, active energy and workouts to look for gentle correlations. Raw HealthKit samples stay on your phone — only a daily summary is stored.")
                     .font(Font.Soma.dishNote)
                     .foregroundStyle(Color.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)

@@ -13,7 +13,14 @@ final class SpeechCapture: ObservableObject {
     @Published private(set) var isRecording: Bool = false
     @Published private(set) var errorText: String?
 
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    /// The person's own language first. `SFSpeechRecognizer(locale:)` is nil
+    /// for a locale Apple's recogniser doesn't support, so fall back to
+    /// English (US) rather than to no dictation at all — the rest of the
+    /// app already follows the device locale for dates and clocks, and a
+    /// hard-coded en-US gave non-English speakers poor transcripts with no
+    /// hint why.
+    private let recognizer = SFSpeechRecognizer(locale: .current)
+        ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private let audioEngine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?

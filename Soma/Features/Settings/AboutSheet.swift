@@ -24,7 +24,7 @@ struct AboutSheet: View {
 
                     AboutSection(
                         title: "what it is",
-                        text: "a quiet food–body record. log a meal in ten seconds. once a week, soma surfaces one hedged pattern from your own data — if there's one worth watching."
+                        text: "a quiet food–body record. log a meal in ten seconds. each night — or when you pull to refresh — soma looks over your last few weeks and surfaces a few hedged patterns from your own data, if there are any worth watching. before there's enough to go on, it just describes what's written down."
                     )
                     AboutSection(
                         title: "what it isn't",

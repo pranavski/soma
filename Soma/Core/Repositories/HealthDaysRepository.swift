@@ -12,20 +12,6 @@ struct HealthDaysRepository {
         self.decoder = SupabaseDates.makeDecoder()
     }
 
-    /// Fetch the last N days of aggregates ordered most-recent-first.
-    /// Used by `generate-insights` inputs on the server, and by the client
-    /// to short-circuit sync if nothing has changed.
-    func fetchRecent(days: Int = 28) async throws -> [HealthDay] {
-        let response = try await client
-            .from("health_days")
-            .select(Self.columns)
-            .order("day", ascending: false)
-            .limit(days)
-            .execute()
-
-        return try decoder.decode([HealthDay].self, from: response.data)
-    }
-
     /// The owner's rows for the trailing window, oldest first — the shape
     /// the Insights charts want (RLS scopes the query to the caller).
     func fetchLastDays(_ days: Int) async throws -> [HealthDay] {
