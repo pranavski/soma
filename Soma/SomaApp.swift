@@ -7,6 +7,12 @@ struct SomaApp: App {
     @StateObject private var session = SessionStore()
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        // Before the first view: Theme resolves each face by name and falls
+        // back to a system font when the name is unknown.
+        SomaFonts.registerBundledFaces()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()
