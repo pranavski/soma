@@ -102,12 +102,17 @@ final class InsightsViewModel: ObservableObject {
         }
         await load()
         isGenerating = false
-        if let generationError, errorText == nil {
-            errorText = "couldn't think it over just now — your notes are safe."
-            #if DEBUG
-            errorText = (errorText ?? "") + "\n\(generationError)"
-            #endif
+        guard let generationError, errorText == nil else { return }
+        if case InsightsRepository.GenerationRefusal.tooSoon = generationError {
+            // Not a failure: the server ran for this person minutes ago and
+            // won't spend another model call yet. Say so without alarm.
+            errorText = "thought it over a few minutes ago — it'll look again in a little while."
+            return
         }
+        errorText = "couldn't think it over just now — your notes are safe."
+        #if DEBUG
+        errorText = (errorText ?? "") + "\n\(generationError)"
+        #endif
     }
 
     /// Two shapes of failure, two sentences. A dropped connection is the

@@ -20,8 +20,17 @@
 //   200 { surfaced, inserted, candidates, reflections }           — ran
 //   200 { surfaced: false, reason: "insufficient_data", reflections } — gated before scoring
 //   200 { surfaced: false, reason: "no_qualifying_patterns", candidates, reflections } — nothing survived, or nothing chosen
+//   429 { error: "too_soon", retry_after_seconds }                — user path only, see below
 //   500 { error: "claude_call_failed", detail }                   — with the reason
 //   500 { error: "bad_model_output" }                             — model broke contract
+//
+// Past the coverage gate a run is one Claude call, and the on-demand path
+// is a pull gesture on the home screen. So a user-initiated run that lands
+// within INSIGHT_RUN_MIN_GAP_MS of the previous run for that user is
+// refused with a 429 before anything is loaded. The cron path is never
+// throttled (the schedule is its throttle) but records its run the same
+// way, so a pull right after the nightly job is also a no-op. The record
+// lives in insight_runs; see that migration.
 //
 // Every run also rebuilds the caller's `reflections` — plain descriptions of
 // what they logged, which need three days rather than the ten the statistics
@@ -77,6 +86,50 @@ import { type Reflection, buildReflections } from "./reflections.ts";
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const WINDOW_DAYS = 30;
 const RECENT_CLAIMS_LIMIT = 15;
+
+/// Minimum gap between two user-initiated runs for the same person.
+/// Ten minutes: long enough that a stuck or repeated pull gesture costs
+/// one model call rather than dozens, short enough that someone who just
+/// logged three meals and wants a fresh look isn't told to wait an hour.
+const INSIGHT_RUN_MIN_GAP_MS = 10 * 60 * 1000;
+
+type RunSource = "cron" | "user";
+
+/// Refuse-or-record for the on-demand path. Returns the seconds the caller
+/// should wait when the previous run was too recent, or null when the run
+/// may proceed — in which case it has already been recorded, so two pulls
+/// racing each other resolve to one run and one refusal rather than two
+/// runs. A read failure lets the run proceed: the limit is a cost guard,
+/// not a correctness gate, and a broken guard must not take the feed down.
+async function claimRun(
+  admin: SupabaseClient,
+  userId: string,
+  source: RunSource,
+): Promise<number | null> {
+  const now = new Date();
+  if (source === "user") {
+    const { data, error } = await admin
+      .from("insight_runs")
+      .select("started_at")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (error) {
+      console.error(`generate-insights: insight_runs read failed — ${error.message}`);
+    } else if (data?.started_at) {
+      const elapsed = now.getTime() - new Date(data.started_at as string).getTime();
+      if (elapsed >= 0 && elapsed < INSIGHT_RUN_MIN_GAP_MS) {
+        return Math.ceil((INSIGHT_RUN_MIN_GAP_MS - elapsed) / 1000);
+      }
+    }
+  }
+  const { error: writeErr } = await admin
+    .from("insight_runs")
+    .upsert({ user_id: userId, started_at: now.toISOString(), source }, { onConflict: "user_id" });
+  if (writeErr) {
+    console.error(`generate-insights: insight_runs write failed — ${writeErr.message}`);
+  }
+  return null;
+}
 
 /// How far back pattern_history is kept. Long enough to hold several
 /// non-overlapping windows (so a long-running pattern can accumulate
@@ -425,20 +478,20 @@ async function callClaude(userMessage: string): Promise<ClaudeResult> {
 
 // ─── Auth ───────────────────────────────────────────────────────────────────
 
-/// Resolve the target user from one of the two auth paths. Returns null
-/// when neither path authenticates.
+/// Resolve the target user from one of the two auth paths, and say which
+/// path it was. Returns null when neither path authenticates.
 async function resolveUser(
   req: Request,
   body: { user_id?: string },
   supabaseUrl: string,
   anonKey: string,
-): Promise<string | null> {
+): Promise<{ userId: string; source: RunSource } | null> {
   const auth = req.headers.get("Authorization") ?? "";
   if (!auth.startsWith("Bearer ")) return null;
 
   const cronSecret = Deno.env.get("INSIGHTS_CRON_SECRET");
   if (cronSecret && auth === `Bearer ${cronSecret}`) {
-    return body.user_id ?? null;
+    return body.user_id ? { userId: body.user_id, source: "cron" } : null;
   }
 
   // User-JWT path: let Supabase verify the token.
@@ -447,7 +500,7 @@ async function resolveUser(
   });
   const { data, error } = await userClient.auth.getUser();
   if (error || !data?.user?.id) return null;
-  return data.user.id;
+  return { userId: data.user.id, source: "user" };
 }
 
 // ─── Entrypoint ─────────────────────────────────────────────────────────────
@@ -467,10 +520,16 @@ serve(async (req) => {
   const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-  const userId = await resolveUser(req, body, supabaseUrl, anonKey);
-  if (!userId) return json(401, { error: "unauthorized" });
+  const caller = await resolveUser(req, body, supabaseUrl, anonKey);
+  if (!caller) return json(401, { error: "unauthorized" });
+  const { userId, source } = caller;
 
   const admin = createClient(supabaseUrl, serviceKey);
+
+  const retryAfter = await claimRun(admin, userId, source);
+  if (retryAfter !== null) {
+    return json(429, { error: "too_soon", retry_after_seconds: retryAfter });
+  }
 
   const { meals, checkins, health } = await loadWindow(admin, userId);
   const { lines, coverage } = buildDigest(meals, checkins, health);

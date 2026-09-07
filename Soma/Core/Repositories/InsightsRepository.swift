@@ -32,10 +32,24 @@ struct InsightsRepository {
     /// Ask the Edge Function to generate insights for the caller now.
     /// The function reads the user from the JWT; the body is intentionally
     /// empty. New rows land in `insights` — refetch to see them.
+    ///
+    /// The function refuses a pull that lands within a few minutes of the
+    /// previous run for this person (429, see generate-insights). That is
+    /// not a failure — the feed is already as fresh as it gets — so it is
+    /// surfaced as its own error for the screen to phrase gently.
     func requestGeneration() async throws {
-        try await client.functions.invoke(
-            "generate-insights",
-            options: FunctionInvokeOptions(body: [String: String]())
-        )
+        do {
+            try await client.functions.invoke(
+                "generate-insights",
+                options: FunctionInvokeOptions(body: [String: String]())
+            )
+        } catch let FunctionsError.httpError(code, _) where code == 429 {
+            throw GenerationRefusal.tooSoon
+        }
+    }
+
+    enum GenerationRefusal: Error {
+        /// A run finished moments ago; the server declined to start another.
+        case tooSoon
     }
 }
