@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// Home-feed view model. The insights feed is the app's front door now:
 /// ranked findings, a pull-to-refresh that asks the engine to think, and
@@ -66,9 +67,23 @@ final class InsightsViewModel: ObservableObject {
             // awaited separately rather than in a throwing group.
             insights = Self.ranked(try await repository.fetchRecent(limit: 20))
         } catch {
-            errorText = "couldn't reach your notes — pull to try again."
+            Self.log.error("insights fetch failed: \(String(describing: error), privacy: .public)")
+            errorText = Self.loadFailureText(for: error)
+            #if DEBUG
+            // On a phone there is no console to read from the build machine,
+            // so a debug build says the quiet part out loud. Release builds
+            // keep the one calm sentence.
+            errorText = (errorText ?? "") + "\n\(error)"
+            #endif
         }
-        reflections = (try? await reflectionsRepository.fetchCurrent()) ?? reflections
+        do {
+            reflections = try await reflectionsRepository.fetchCurrent()
+        } catch {
+            // Reflections are the early-days garnish; losing them is not
+            // worth a message. Logged, though — silence in the UI should
+            // not mean silence in the logs.
+            Self.log.error("reflections fetch failed: \(String(describing: error), privacy: .public)")
+        }
         isLoading = false
     }
 
@@ -78,18 +93,39 @@ final class InsightsViewModel: ObservableObject {
         guard !Self.isPreview else { return }
         errorText = nil
         isGenerating = true
-        var generationFailed = false
+        var generationError: Error?
         do {
             try await repository.requestGeneration()
         } catch {
-            generationFailed = true
+            Self.log.error("insight generation failed: \(String(describing: error), privacy: .public)")
+            generationError = error
         }
         await load()
         isGenerating = false
-        if generationFailed && errorText == nil {
+        if let generationError, errorText == nil {
             errorText = "couldn't think it over just now — your notes are safe."
+            #if DEBUG
+            errorText = (errorText ?? "") + "\n\(generationError)"
+            #endif
         }
     }
+
+    /// Two shapes of failure, two sentences. A dropped connection is the
+    /// phone's; anything else — an expired session, a decode that no longer
+    /// matches the table, a 500 — is ours, and saying "couldn't reach" for
+    /// those sends whoever is debugging it to look at the wrong thing.
+    static func loadFailureText(for error: Error) -> String {
+        // The SDK sometimes hands back its own error with the URL failure
+        // tucked underneath, so check both levels before blaming the network.
+        let ns = error as NSError
+        let offline = ns.domain == NSURLErrorDomain
+            || ns.underlyingErrors.contains { ($0 as NSError).domain == NSURLErrorDomain }
+        return offline
+            ? "couldn't reach your notes — pull to try again."
+            : "your notes didn't come back just now — pull to try again."
+    }
+
+    private static let log = Logger(subsystem: "com.pranavsurampudi.soma", category: "insights")
 
     /// Feed order: strongest signals first, newest first within a level.
     static func ranked(_ items: [Insight]) -> [Insight] {

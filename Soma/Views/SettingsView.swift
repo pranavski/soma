@@ -2,12 +2,15 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var session: SessionStore
+    @EnvironmentObject private var disclosure: AIDisclosure
 
     @State private var showHealthKit = false
     @State private var showAbout = false
     @State private var showCheckin = false
     @State private var showFeedback = false
     @State private var showDeleteAccount = false
+    @State private var showPrivacy = false
+    @State private var showAIConsent = false
     @State private var exportURL: URL?
     @State private var isExporting = false
     @State private var exportError: String?
@@ -35,7 +38,7 @@ struct SettingsView: View {
                         .padding(.horizontal, Theme.Spacing.xl)
                         .padding(.top, Theme.Spacing.xl)
 
-                    Spacer(minLength: 160)
+                    Spacer(minLength: Theme.TabBar.scrollBottomInset)
                 }
                 .padding(.top, Theme.Spacing.l)
             }
@@ -52,7 +55,7 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showCheckin) {
             DailyCheckinSheet()
-                .presentationDetents([.medium])
+                .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showFeedback) {
@@ -66,6 +69,17 @@ struct SettingsView: View {
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
+        .sheet(isPresented: $showPrivacy) {
+            PrivacyPolicySheet()
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showAIConsent) {
+            AIConsentSettingsSheet()
+                .environmentObject(disclosure)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
         .sheet(item: Binding(
             get: { exportURL.map(ExportItem.init) },
             set: { newValue in exportURL = newValue?.url }
@@ -76,16 +90,29 @@ struct SettingsView: View {
 
     private func rowActions() -> ContentsList.Actions {
         ContentsList.Actions(
-            onSignIn:       { showAbout = true }, // "Sign-in" row shows account details via About for v1
             onHealthKit:    { showHealthKit = true },
-            onRanges:       { showAbout = true },
-            onInsights:     { showCheckin = true }, // link Insights row to check-in — that's the input the engine needs
+            healthKitNote:  healthKitNote,
+            onCheckin:      { showCheckin = true },
+            onAIConsent:    { showAIConsent = true },
+            aiConsentNote:  disclosure.hasConsented
+                            ? "Claude reads your meals · on"
+                            : "Claude reads your meals · off",
             onExport:       { Task { await runExport() } },
+            onPrivacy:      { showPrivacy = true },
             onAbout:        { showAbout = true },
             onFeedback:     { showFeedback = true },
             onDeleteAccount:{ showDeleteAccount = true },
             onSignOut:      { Task { await session.signOut() } }
         )
+    }
+
+    /// The row used to read "sleep, steps, energy" whether or not anything
+    /// was ever connected. Say where the sync actually stands instead —
+    /// it's the only place the answer is visible without opening the sheet.
+    private var healthKitNote: String {
+        guard HealthKitSync.isConnected else { return "not connected" }
+        guard let last = HealthKitSync.lastSyncedAt else { return "connected" }
+        return "synced \(SomaFormat.relative(last))"
     }
 
     private func runExport() async {
@@ -127,11 +154,13 @@ private struct ExportItem: Identifiable {
 
 private struct ContentsList: View {
     struct Actions {
-        var onSignIn: () -> Void
         var onHealthKit: () -> Void
-        var onRanges: () -> Void
-        var onInsights: () -> Void
+        var healthKitNote: String
+        var onCheckin: () -> Void
+        var onAIConsent: () -> Void
+        var aiConsentNote: String
         var onExport: () -> Void
+        var onPrivacy: () -> Void
         var onAbout: () -> Void
         var onFeedback: () -> Void
         var onDeleteAccount: () -> Void
@@ -147,15 +176,19 @@ private struct ContentsList: View {
         var action: (() -> Void)? = nil
     }
 
+    /// Each row goes somewhere different. "Sign-in" and "Ranges" used to
+    /// open the same About sheet as "About" — three chapters, one
+    /// destination — so they're folded into About, and the two rows Apple
+    /// actually looks for (privacy policy, AI consent) take their place.
     private var entries: [Entry] {
         [
-            Entry(title: "Sign-in",       note: "Apple ID · signed in",   glyph: .leaf,   action: actions.onSignIn),
-            Entry(title: "HealthKit",     note: "sleep, steps, energy",   glyph: .sprig,  action: actions.onHealthKit),
-            Entry(title: "Check-in",      note: "how the day felt",       glyph: .cherry, action: actions.onInsights),
-            Entry(title: "Ranges",        note: "always shown as a span", glyph: .lemon,  action: actions.onRanges),
+            Entry(title: "HealthKit",     note: actions.healthKitNote,    glyph: .sprig,  action: actions.onHealthKit),
+            Entry(title: "Check-in",      note: "today, or a day you missed", glyph: .cherry, action: actions.onCheckin),
+            Entry(title: "Reading meals", note: actions.aiConsentNote,    glyph: .lemon,  action: actions.onAIConsent),
             Entry(title: "Export",        note: "your data, plainly",     glyph: .knife,  action: actions.onExport),
+            Entry(title: "Privacy",       note: "what leaves your phone", glyph: .leaf,   action: actions.onPrivacy),
             Entry(title: "Send feedback", note: "tell us what could be better", glyph: .cherry, action: actions.onFeedback),
-            Entry(title: "About",         note: "what soma is, isn't",  glyph: .bowl,   action: actions.onAbout),
+            Entry(title: "About",         note: "what soma is, isn't",    glyph: .bowl,   action: actions.onAbout),
             Entry(title: "Sign out",      note: "close the kitchen",      glyph: .knife,  action: actions.onSignOut),
             Entry(title: "Delete account", note: "erase everything, forever", glyph: .knife, action: actions.onDeleteAccount)
         ]

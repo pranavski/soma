@@ -10,6 +10,8 @@ description: Create and maintain Soma's custom SVG assets — app icon, tab bar
 
 ## Where things live
 - Source SVGs: `DesignAssets/svg/` (committed; the source of truth)
+- App icon master: `DesignAssets/master/app-icon-1024.png` (a supplied raster,
+  not an SVG — edit or replace that file, never the asset catalog PNG)
 - Generated: `Soma/Assets.xcassets/` (never hand-edit generated PNGs)
 - Conversion script: `DesignAssets/build-assets.sh`
 
@@ -24,9 +26,9 @@ description: Create and maintain Soma's custom SVG assets — app icon, tab bar
   (plates, rings, waves) over sharp angles. No emoji inside SVGs.
 
 ## Required assets
-1. App icon: a stylized plate-as-ring mark — concentric circles with a mint
-   gradient arc breaking the rim (echoes the completion ring). Flat, bold,
-   readable at 60px. Provide 1024×1024 master.
+1. App icon: a line-drawn profile lifting chopsticks from a persimmon bowl on
+   paper (`#F7F2E8`) — the record of a person eating, not a diet badge. Flat,
+   bold, readable at 60px. 1024×1024 master, no alpha in the built PNG.
 2. Tab icons (4): today (plate ring), record (stacked bars), insights
    (spark/asterisk), dishes (bowl) — 24×24 viewBox, stroke-based, single
    currentColor so SwiftUI can tint active/inactive.

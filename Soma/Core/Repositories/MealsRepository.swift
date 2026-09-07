@@ -38,30 +38,21 @@ struct MealsRepository {
     /// Insert a new meal in `pending` state. The Edge Function fills in
     /// dish_name/calories on success; the row exists in the meantime so the
     /// Today screen can render a "parsing…" card without waiting.
-    ///
-    /// `id` can be supplied by the caller — the photo path convention
-    /// (`<user_id>/<meal_id>.jpg`) needs the meal id before the row exists,
-    /// so the photo flow generates the UUID client-side, uploads, then
-    /// inserts.
     @discardableResult
     func insertPendingMeal(
         source: Meal.Source,
         voiceTranscript: String?,
-        photoPath: String? = nil,
-        id: UUID? = nil,
         eatenAt: Date = Date()
     ) async throws -> UUID {
         let userId = try await client.auth.session.user.id
 
         let row = PendingMealInsert(
-            id: id,
             userId: userId,
             eatenAt: Self.iso(eatenAt),
             eatenDate: Self.localDateString(eatenAt),
             eatenHour: Self.localHour(eatenAt),
             source: source.rawValue,
-            voiceTranscript: voiceTranscript,
-            photoPath: photoPath
+            voiceTranscript: voiceTranscript
         )
 
         let response = try await client
@@ -77,38 +68,21 @@ struct MealsRepository {
     }
 
     private struct PendingMealInsert: Encodable {
-        let id: UUID?
         let userId: UUID
         let eatenAt: String
         let eatenDate: String
         let eatenHour: Int
         let source: String
         let voiceTranscript: String?
-        let photoPath: String?
 
         enum CodingKeys: String, CodingKey {
-            case id
             case userId          = "user_id"
             case eatenAt         = "eaten_at"
             case eatenDate       = "eaten_date"
             case eatenHour       = "eaten_hour"
             case source
             case voiceTranscript = "voice_transcript"
-            case photoPath       = "photo_path"
         }
-    }
-
-    /// Upload a prepared JPEG to the private `meal-photos` bucket under the
-    /// RLS-enforced path `<user_id>/<meal_id>.jpg` and return that path.
-    /// The bucket's insert policy only admits paths whose first segment is
-    /// the caller's own auth.uid(), so a bad path fails server-side too.
-    func uploadMealPhoto(_ data: Data, mealId: UUID) async throws -> String {
-        let userId = try await client.auth.session.user.id
-        let path = "\(userId.uuidString.lowercased())/\(mealId.uuidString.lowercased()).jpg"
-        try await client.storage
-            .from("meal-photos")
-            .upload(path, data: data, options: FileOptions(contentType: "image/jpeg"))
-        return path
     }
 
     /// One-tap repeat. Copies the most recent parsed row that carries the
@@ -196,6 +170,22 @@ struct MealsRepository {
 
         struct InsertedId: Decodable { let id: UUID }
         return try JSONDecoder().decode(InsertedId.self, from: response.data).id
+    }
+
+    /// Take a meal off the record — a mis-tap, a double-log, or something
+    /// the person simply doesn't want counted. RLS ("owner can delete" on
+    /// public.meals) scopes this to the caller, so no user_id filter here.
+    ///
+    /// What goes with it: `meal_items` cascade, and any correction the user
+    /// filed keeps its own copy of the text (meal_corrections.meal_id is ON
+    /// DELETE SET NULL), so removing a meal never destroys the record of a
+    /// correction they took the trouble to write.
+    func deleteMeal(_ meal: Meal) async throws {
+        try await client
+            .from("meals")
+            .delete()
+            .eq("id", value: meal.id)
+            .execute()
     }
 
     /// Distinct recent dish names ordered by most-recent-eaten. Used to

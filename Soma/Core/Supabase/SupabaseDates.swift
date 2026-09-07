@@ -22,6 +22,13 @@ enum SupabaseDates {
         withFractional.string(from: date)
     }
 
+    /// Parse a `timestamptz` string in either precision. Mirrors the decoder
+    /// below, for the few places that read a raw column without going
+    /// through `Codable`.
+    static func date(from text: String) -> Date? {
+        withFractional.date(from: text) ?? withoutFractional.date(from: text)
+    }
+
     /// `YYYY-MM-DD` in the caller's local timezone. Used for `date` columns
     /// (`check_date`, `day`, `week_start`) where the spec pins to *user local*
     /// rather than UTC — the "did you eat late yesterday" question lives on

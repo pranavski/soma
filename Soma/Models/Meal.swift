@@ -78,11 +78,7 @@ extension Meal {
 
     var isRepeat: Bool { source == .repeated }
 
-    var timeLabel: String {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        return f.string(from: eatenAt)
-    }
+    var timeLabel: String { SomaFormat.time(eatenAt) }
 
     /// "~320–420" or nil if we haven't parsed yet. Always a range — the
     /// spec forbids a bare number anywhere it might be read as a target.

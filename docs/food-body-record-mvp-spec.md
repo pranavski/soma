@@ -282,39 +282,6 @@ calls Claude (`claude-sonnet-4-6`) with the structured-output contract
 below, then **updates the `meals` row** and inserts `meal_items` rows
 using the service role.
 
-**Menu lookup.** A deterministic gate (`parse-meal/venue.ts`) checks the
-transcript for a restaurant, chain, packaged brand, or a `from X` / `at X`
-phrase. On a hit, and only then, the Claude call is made with the
-`web_search` server tool (`web_search_20260209`, `max_uses: 3`) so the
-figures can come from the operator's published menu rather than the
-model's memory — the same reasoning as the caffeine anchors in `fdc.ts`,
-applied to a table too large and too volatile to commit. Claude still
-decides whether to search; the gate only decides whether it may, because a
-search costs seconds on a path that promises ten of them and buys nothing
-for home cooking. Three consequences for anyone editing this function:
-
-- The reply may contain several `text` blocks (a preamble, then the
-  answer). **The JSON is the last one**, not the first.
-- A long tool loop returns `stop_reason: "pause_turn"` and must be resumed
-  by echoing the assistant content back verbatim.
-- A searched attempt that fails for any reason retries once **without**
-  the tool, so a search outage degrades to the old behavior instead of a
-  422. The photo branch never searches: detector labels carry no brand.
-
-Because the query leaves Anthropic for a search provider, this is a new
-third-party flow under 5.1.2(i) — the consent key is versioned
-(`soma.ai.parseConsent.v2`) so prior consent does not silently cover it.
-
-**The lookup is off until `MENU_LOOKUP_ENABLED=true`.** The function and
-the app ship on different trains, and only the app's v2 copy describes the
-search, so an armed function running ahead of that build would search for
-people who consented to something narrower. Arm it after the App Store
-build carrying v2 consent is out:
-
-```
-supabase secrets set MENU_LOOKUP_ENABLED=true
-```
-
 **Claude output contract** (strict JSON, validated server-side):
 ```json
 {

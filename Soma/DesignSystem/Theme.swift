@@ -26,6 +26,18 @@ enum Theme {
         static let nib:      CGFloat = 1.6
     }
 
+    /// Chrome the tab bar owns at the bottom of every signed-in screen.
+    /// `barHeight` is the painted strip above the home indicator; screens
+    /// that pin something (Today's capture pill, Insights' quick-log) sit
+    /// `contentClearance` up from the bottom so they clear the bar instead
+    /// of guessing at a magic number each time.
+    enum TabBar {
+        static let barHeight: CGFloat = 62
+        static let contentClearance: CGFloat = barHeight + Spacing.xl
+        /// Bottom padding for the last element of a scrolling screen.
+        static let scrollBottomInset: CGFloat = contentClearance + Spacing.xxl
+    }
+
     /// 3×5 index card proportions, the spine of the Mise direction.
     enum Card {
         static let aspect: CGFloat = 5.0 / 3.0     // h/w when laid as a portrait card

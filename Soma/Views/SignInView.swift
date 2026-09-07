@@ -4,6 +4,7 @@ import AuthenticationServices
 struct SignInView: View {
     @EnvironmentObject private var session: SessionStore
     @State private var isWorking = false
+    @State private var showPrivacy = false
 
     var body: some View {
         ZStack {
@@ -59,14 +60,31 @@ struct SignInView: View {
                         .foregroundStyle(Color.persimmon)
                 }
 
-                Text("by signing in you accept that this isn't medical advice.")
-                    .font(Font.Soma.margin)
-                    .foregroundStyle(Color.inkSoft.opacity(0.8))
-                    .padding(.bottom, Theme.Spacing.l)
+                VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+                    Text("by signing in you accept that this isn't medical advice.")
+                        .font(Font.Soma.margin)
+                        .foregroundStyle(Color.inkSoft.opacity(0.8))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    // 5.1.1(i) wants the policy reachable in the app. Putting
+                    // it here as well as in the kitchen means a reviewer meets
+                    // it before creating an account, not after.
+                    Button { showPrivacy = true } label: {
+                        Text("privacy policy")
+                            .font(Font.Soma.margin)
+                            .underline()
+                            .foregroundStyle(Color.inkSoft)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.bottom, Theme.Spacing.l)
             }
             .padding(.horizontal, Theme.Spacing.xl)
             .padding(.vertical, Theme.Spacing.xxl)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .sheet(isPresented: $showPrivacy) {
+            PrivacyPolicySheet()
         }
     }
 }

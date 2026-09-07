@@ -18,7 +18,10 @@ struct InsightsRepository {
     func fetchRecent(limit: Int = 20) async throws -> [Insight] {
         let response = try await client
             .from("insights")
-            .select("id,created_at,claim,evidence,confidence,suggested_action,window_days")
+            // The evidence trio rides along: without it every row decodes
+            // with a nil mechanism and the published-context block silently
+            // never renders, however much science the row actually carries.
+            .select("id,created_at,claim,evidence,confidence,suggested_action,window_days,mechanism,evidence_citation,evidence_grade")
             .order("created_at", ascending: false)
             .limit(limit)
             .execute()

@@ -26,6 +26,7 @@ struct CorrectionSheet: View {
     @State private var newItemQuantity: String = ""
     @State private var isSubmitting = false
     @State private var errorText: String?
+    @State private var didLoadItems = false
 
     private let repository: CorrectionsRepository
 
@@ -83,12 +84,31 @@ struct CorrectionSheet: View {
                         Text(errorText)
                             .font(Font.Soma.margin)
                             .foregroundStyle(Color.persimmon)
+                    } else if !canSubmit {
+                        // The sheet also opens on meals that failed to parse,
+                        // where the dish and both numbers are blank. Say why
+                        // "save" is greyed out instead of leaving the user
+                        // poking at a dead button.
+                        Text("needs a dish name and both ends of the range.")
+                            .font(Font.Soma.margin)
+                            .foregroundStyle(Color.inkSoft)
                     }
 
                     actionRow
                 }
                 .padding(Theme.Spacing.xl)
             }
+            // The calorie fields use a number pad, which has no return key —
+            // without this there's no way to put the keyboard away.
+            .scrollDismissesKeyboard(.interactively)
+        }
+        // Start from the components parse-meal already found, so "save" keeps
+        // them instead of quietly filing a correction that says the meal had
+        // nothing in it.
+        .task {
+            guard !didLoadItems else { return }
+            didLoadItems = true
+            items = await repository.fetchItems(mealId: meal.id)
         }
     }
 

@@ -1,6 +1,6 @@
 # Soma Privacy Policy
 
-_Last updated: July 8, 2026_
+_Last updated: August 2, 2026_
 
 Soma is a food–body record. You log meals in about ten seconds, optionally
 connect Apple Health, and Soma looks for honest, hedged correlations in your
@@ -45,46 +45,86 @@ rows.
 ### Apple Health (HealthKit) — optional, read-only
 
 If you connect Apple Health, Soma reads steps, sleep, resting heart rate,
-and heart rate variability — read-only, never writing anything back.
+heart rate variability, body weight, active energy and workouts —
+read-only, never writing anything back.
 
 **Raw HealthKit samples are processed entirely on your device and never
 leave it.** Soma computes one summary per day (total steps, sleep minutes,
-average resting heart rate, average HRV) and syncs only those four daily
-numbers. That's the whole of what our servers ever see from Apple Health.
+average resting heart rate, average HRV, weight, active energy burned and
+workout minutes) and syncs only those daily numbers. That's the whole of
+what our servers ever see from Apple Health.
 
-You can disconnect at any time in iOS Settings → Privacy & Security →
-Health. Health data is never used for advertising and never shared with
-third parties beyond the processing described below.
+Once connected, Soma asks iOS to notify it when new Health samples arrive,
+so the daily summary stays current without you having to open the app. The
+work is the same either way: summarise on device, sync the daily numbers.
+
+You can disconnect at any time — in Soma under Kitchen → HealthKit, or in
+iOS Settings → Privacy & Security → Health. Disconnecting stops all further
+reading and syncing; daily summaries already synced stay until you delete
+your account. Health data is never used for advertising and never shared
+with third parties beyond the processing described below.
 
 ### Energy check-ins
 
 If you record a daily energy level (a simple 0–5), it's stored alongside
 your daily summary and used only by the insight engine.
 
-## How meal parsing works (AI processing)
+## Third-party AI: Anthropic's Claude
 
-When you log a meal by voice or text, the transcript is sent from our
-server to Anthropic's Claude API to be parsed into a structured meal
-(dish name, calorie and macro ranges). Two things to know:
+Soma sends data to **Anthropic's Claude** for three purposes, and only after
+you have explicitly agreed in the app. Soma asks once, before your first
+meal is parsed, and you can withdraw consent at any time in
+**the kitchen → Reading meals**.
+
+**1. Parsing a meal.** When you log a meal by voice or text, the transcript
+is sent to Claude to be turned into a structured entry (dish name, calorie
+and macro ranges, cuisine).
+
+**2. The nightly look-back.** Once a night, if there is enough data, Soma
+sends Claude a compact digest of roughly your last 30 days so it can look
+for patterns worth mentioning. That digest contains your recent meals, your
+energy check-ins, and the **daily** Apple Health totals described above —
+sleep minutes, steps, resting heart rate, HRV, weight, active energy and
+workout minutes. It never contains raw HealthKit samples, which never leave
+your phone.
+
+In every case:
 
 - The request goes **server-to-server** from our backend; the app never
   talks to Anthropic directly, and no API credentials live on your phone.
-- We send only the meal text needed for parsing — no health data, no
-  account identifiers beyond what's technically required.
+- The digest carries **no name, no email, and no account identifier** — it
+  is a list of dated numbers and dish names.
+- Audio is never sent. Speech is transcribed on your device where your
+  iPhone supports it, and only the resulting text is used.
 
 Anthropic processes this data as a service provider under its commercial
 terms and does not use it to train models.
 
-## Weekly insights
+If you decline, Soma keeps working: meals still save, they simply stay
+unparsed, and you can fill in the details yourself with "not quite right?"
+on any card.
 
-Once a week, our server looks at your last ~28 days of meals, energy
-check-ins, and daily health summaries to see whether any of a small set of
-pre-defined correlations holds (for example: "late dinners tend to precede
-lower-energy mornings"). Insights are:
+## Insights
+
+Insights are:
 
 - computed from **your data only**,
 - always hedged ("worth watching, not a verdict"), and
 - never medical advice, never prescriptive, never a diet plan.
+
+Some insights also show a short "why this might happen" note with a
+reference to published research. That note is **not about you** and is not
+generated from your data: it comes from a fixed list of studies built into
+the app, and it only appears when a pattern already found in your own logs
+matches one of them. Nothing about you is sent anywhere to produce it, and
+no new data leaves your device or your account because of it — the study
+list ships inside the app itself.
+
+## Photos
+
+Photo meal logging is **not part of this version**. Soma does not take,
+upload, or store meal photos. If that changes, this policy, the App Store
+privacy label, and the in-app disclosure will be updated first.
 
 ## The one piece of shared data: dish-name aliases
 
@@ -103,11 +143,11 @@ Your data is stored with Supabase (our database and backend host),
 encrypted in transit (TLS) and at rest. Access is enforced per-account with
 row-level security. Our service providers are:
 
-| Provider  | What they do              | What they see                                  |
-|-----------|---------------------------|------------------------------------------------|
-| Apple     | Sign in with Apple        | Authentication only                             |
-| Supabase  | Database, auth, functions | Your account ID, meal logs, daily summaries     |
-| Anthropic | Meal-text parsing         | Meal text only, transiently, no model training  |
+| Provider  | What they do                      | What they see                                                                       |
+|-----------|-----------------------------------|-------------------------------------------------------------------------------------|
+| Apple     | Sign in with Apple                | Authentication only                                                                  |
+| Supabase  | Database, auth, functions         | Your account ID, meal logs, daily summaries                                          |
+| Anthropic | Meal parsing, nightly look-back | Meal text, and a de-identified digest of daily health totals and check-ins; transient, no model training |
 
 No other third parties receive your data. We do not use advertising or
 analytics SDKs.

@@ -1,16 +1,33 @@
-import PhotosUI
 import SwiftUI
 
 struct TodayView: View {
     @StateObject private var vm = TodayViewModel()
-    @State private var showCapture = false
-    @State private var showCheckin = false
+    /// Same family as showCheckin below: a headless simulator run can open
+    /// the ORDER UP ticket for a screenshot.
+    @State private var showCapture: Bool = {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["SOMA_PREVIEW_SHEET"] == "capture"
+        #else
+        return false
+        #endif
+    }()
+    /// Same family as SOMA_PREVIEW_TAB in RootView: lets a headless
+    /// simulator run open the check-in sheet for a screenshot.
+    @State private var showCheckin: Bool = {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["SOMA_PREVIEW_SHEET"] == "checkin"
+        #else
+        return false
+        #endif
+    }()
     /// Meal currently being corrected via the "not quite right?" sheet.
     /// Nil = sheet dismissed. We hold the whole `Meal` (not just id) so
     /// the sheet can pre-fill fields without another round-trip.
     @State private var correctingMeal: Meal?
-
-    private let now = Date()
+    /// Meal the card menu asked to remove, awaiting confirmation. Held
+    /// here rather than on the card for the reason in `MealCardActions`.
+    @State private var deletingMeal: Meal?
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -18,11 +35,11 @@ struct TodayView: View {
 
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: Theme.Spacing.xl) {
-                    HeaderBlock(date: now)
+                    HeaderBlock(date: vm.now)
                         .padding(.top, Theme.Spacing.l)
                         .padding(.horizontal, Theme.Spacing.xl)
 
-                    PhaseQuote()
+                    PhaseQuote(now: vm.now)
                         .padding(.horizontal, Theme.Spacing.xl)
 
                     if vm.needsCheckin {
@@ -33,12 +50,13 @@ struct TodayView: View {
                     CardStream(
                         meals: vm.meals,
                         repeats: vm.recentDishes,
-                        onRepeat: { dish in Task { await vm.repeatDish(dish) } },
-                        onCorrect: { meal in correctingMeal = meal }
+                        onRepeat: { dish in Task { await vm.repeatDish(dish, eatenAt: Date()) } },
+                        onCorrect: { meal in correctingMeal = meal },
+                        onDeleteRequest: { meal in deletingMeal = meal }
                     )
                         .padding(.horizontal, Theme.Spacing.xl)
 
-                    NextSlot(now: now)
+                    NextSlot(now: vm.now)
                         .padding(.horizontal, Theme.Spacing.xl)
 
                     if let err = vm.errorText {
@@ -48,38 +66,39 @@ struct TodayView: View {
                             .padding(.horizontal, Theme.Spacing.xl)
                     }
 
-                    Spacer(minLength: 140)
+                    Spacer(minLength: Theme.TabBar.scrollBottomInset)
                 }
             }
             .task { await vm.load() }
             .refreshable { await vm.load() }
+            // Coming back from the background after midnight has to re-date
+            // the screen; without this the header keeps yesterday's day.
+            .onChange(of: scenePhase) { _, phase in
+                guard phase == .active else { return }
+                Task { await vm.load() }
+            }
 
             VStack {
                 Spacer()
                 CaptureButton {
                     showCapture = true
                 }
-                // The SomaTabBar in RootView overlays the bottom ~86pt of
-                // this view. Push the capture pill above the bar so it isn't
-                // eaten by the tab strip.
-                .padding(.bottom, 96)
+                // Sit above the tab strip in RootView. Shared constant so the
+                // pill and the bar can't drift apart.
+                .padding(.bottom, Theme.TabBar.contentClearance)
             }
             .ignoresSafeArea(.keyboard, edges: .bottom)
         }
         .sheet(isPresented: $showCapture) {
             CaptureSheet(
                 recentDishes: vm.recentDishes,
-                onSubmit: { transcript, source in
+                onSubmit: { transcript, source, eatenAt in
                     showCapture = false
-                    Task { await vm.submit(transcript: transcript, source: source) }
+                    Task { await vm.submit(transcript: transcript, source: source, eatenAt: eatenAt) }
                 },
-                onPhoto: { image in
+                onRepeat: { dish, eatenAt in
                     showCapture = false
-                    Task { await vm.submitPhoto(image) }
-                },
-                onRepeat: { dish in
-                    showCapture = false
-                    Task { await vm.repeatDish(dish) }
+                    Task { await vm.repeatDish(dish, eatenAt: eatenAt) }
                 },
                 onCancel: { showCapture = false }
             )
@@ -87,9 +106,17 @@ struct TodayView: View {
             .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showCheckin) {
-            DailyCheckinSheet()
-                .presentationDetents([.medium])
-                .presentationDragIndicator(.visible)
+            DailyCheckinSheet {
+                // Drop the nudge as soon as the check is filed — the screen
+                // otherwise keeps asking until the next full reload.
+                Task { await vm.load() }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+        .mealDeleteConfirmation(for: $deletingMeal) { meal in
+            deletingMeal = nil
+            Task { await vm.delete(meal) }
         }
         .sheet(item: $correctingMeal) { meal in
             CorrectionSheet(meal: meal) {
@@ -140,7 +167,7 @@ private struct HeaderBlock: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-            Text(weekdayHand(date))
+            Text(SomaFormat.longDay(date))
                 .font(Font.Soma.dateLabel)
                 .foregroundStyle(Color.inkSoft)
 
@@ -155,12 +182,6 @@ private struct HeaderBlock: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
-
-    private func weekdayHand(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "EEEE, MMMM d"
-        return f.string(from: d).lowercased()
-    }
 }
 
 // MARK: - Phase quote
@@ -168,17 +189,18 @@ private struct HeaderBlock: View {
 // The recipe cards carry the personality; the headline is one beat of voice.
 
 private struct PhaseQuote: View {
-    private let hour = Calendar.current.component(.hour, from: Date())
+    let now: Date
 
     var body: some View {
         Text(phaseHeadline)
             .font(Font.Soma.pullQuote)
             .foregroundStyle(Color.inkSoft)
             .lineSpacing(2)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var phaseHeadline: String {
-        switch hour {
+        switch Calendar.current.component(.hour, from: now) {
         case 5..<12:  return "A new morning."
         case 12..<14: return "Midday, quietly."
         case 14..<17: return "Afternoon things."
@@ -196,9 +218,10 @@ private struct CardStream: View {
     let repeats: [String]
     var onRepeat: (String) -> Void
     var onCorrect: (Meal) -> Void
+    var onDeleteRequest: (Meal) -> Void
 
     var body: some View {
-        VStack(spacing: Theme.Spacing.l) {
+        VStack(alignment: .leading, spacing: Theme.Spacing.l) {
             ForEach(meals, id: \.id) { meal in
                 RecipeCard(
                     timeLabel: meal.timeLabel,
@@ -243,6 +266,15 @@ private struct CardStream: View {
                         .padding(Theme.Spacing.m)
                     }
                 }
+                .mealCardActions(
+                    for: meal,
+                    onCorrect: onCorrect,
+                    onDeleteRequest: onDeleteRequest
+                )
+            }
+
+            if !meals.isEmpty {
+                MealCardHint()
             }
         }
     }
@@ -257,37 +289,30 @@ private struct NextSlot: View {
     let now: Date
 
     var body: some View {
-        ZStack {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("now — \(SomaFormat.time(now).lowercased())")
+                .font(Font.Soma.timestamp)
+                .foregroundStyle(Color.persimmon)
+            Text("nothing plated yet")
+                .font(Font.Soma.dishSmall)
+                .foregroundStyle(Color.inkSoft.opacity(0.85))
+                .fixedSize(horizontal: false, vertical: true)
+            Text("tap tell me when you eat next.")
+                .font(Font.Soma.margin)
+                .foregroundStyle(Color.inkSoft)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(Theme.Card.bodyInset)
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .leading)
+        // minHeight, not height: at accessibility text sizes a fixed 96
+        // let the three lines spill straight out of the dashed border.
+        .background(
             RoundedRectangle(cornerRadius: Theme.Radius.indexCard, style: .continuous)
                 .strokeBorder(
                     Color.persimmon.opacity(0.55),
                     style: StrokeStyle(lineWidth: 1.0, dash: [4, 5])
                 )
-                .frame(height: 96)
-
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("now — \(handTime(now).lowercased())")
-                        .font(Font.Soma.timestamp)
-                        .foregroundStyle(Color.persimmon)
-                    Spacer()
-                }
-                Text("nothing plated yet")
-                    .font(Font.Soma.dishSmall)
-                    .foregroundStyle(Color.inkSoft.opacity(0.85))
-                Text("tap tell me when you eat next.")
-                    .font(Font.Soma.margin)
-                    .foregroundStyle(Color.inkSoft)
-            }
-            .padding(.horizontal, Theme.Card.bodyInset)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private func handTime(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        return f.string(from: d)
+        )
     }
 }
 
@@ -339,258 +364,6 @@ private struct NibMark: Shape {
     }
 }
 
-// MARK: - Capture sheet — ORDER UP ticket
-
-private struct CaptureSheet: View {
-    var recentDishes: [String]
-    var onSubmit: (String, Meal.Source) -> Void
-    var onPhoto: (UIImage) -> Void
-    var onRepeat: (String) -> Void
-    var onCancel: () -> Void
-
-    @StateObject private var speech = SpeechCapture()
-    @State private var typed: String = ""
-    @State private var showCamera = false
-    @State private var photoItem: PhotosPickerItem?
-    @FocusState private var typedFocused: Bool
-
-    /// Live source of truth for what we'd send to parse-meal. Mirrors the
-    /// recognizer while it's running, otherwise the user's typed edits.
-    private var workingText: String {
-        speech.isRecording ? speech.transcript : typed
-    }
-
-    private var canSubmit: Bool {
-        !workingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    var body: some View {
-        ZStack {
-            PaperBackground()
-            VStack(alignment: .leading, spacing: Theme.Spacing.l) {
-                HStack(spacing: Theme.Spacing.s) {
-                    Text("ORDER UP")
-                        .font(Font.Soma.sectionTag)
-                        .tracking(3)
-                        .foregroundStyle(Color.ink)
-                    Text("·")
-                        .font(Font.Soma.sectionTag)
-                        .foregroundStyle(Color.inkSoft)
-                    Text(stampedTime())
-                        .font(Font.Soma.sectionTag)
-                        .tracking(2)
-                        .foregroundStyle(Color.inkSoft)
-                }
-                .padding(.top, Theme.Spacing.s)
-
-                Text("tell me")
-                    .font(Font.Soma.dayLine)
-                    .foregroundStyle(Color.ink)
-
-                transcriptField
-
-                photoRow
-
-                if let err = speech.errorText {
-                    Text(err)
-                        .font(Font.Soma.margin)
-                        .foregroundStyle(Color.inkSoft)
-                }
-
-                if !recentDishes.isEmpty {
-                    RepeatStrip(dishes: recentDishes, onRepeat: onRepeat)
-                }
-
-                Spacer(minLength: 0)
-
-                actionRow
-            }
-            .padding(Theme.Spacing.xl)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .onDisappear { speech.stop() }
-        .fullScreenCover(isPresented: $showCamera) {
-            CameraPicker { image in onPhoto(image) }
-                .ignoresSafeArea()
-        }
-        .onChange(of: photoItem) { _, item in
-            guard let item else { return }
-            Task {
-                if let data = try? await item.loadTransferable(type: Data.self),
-                   let image = UIImage(data: data) {
-                    onPhoto(image)
-                }
-                photoItem = nil
-            }
-        }
-    }
-
-    /// "or show me" — camera + library entry points. The camera chip hides
-    /// itself where no camera exists (simulator); the library chip is the
-    /// out-of-process PhotosPicker, so no permission prompt is needed.
-    private var photoRow: some View {
-        HStack(spacing: Theme.Spacing.s) {
-            Text("or show me")
-                .font(Font.Soma.margin)
-                .foregroundStyle(Color.inkSoft)
-
-            if CameraPicker.isAvailable {
-                Button {
-                    typedFocused = false
-                    showCamera = true
-                } label: {
-                    photoChip("camera", "snap it")
-                }
-                .buttonStyle(.plain)
-            }
-
-            PhotosPicker(selection: $photoItem, matching: .images) {
-                photoChip("photo.on.rectangle", "from photos")
-            }
-            .buttonStyle(.plain)
-        }
-    }
-
-    private func photoChip(_ symbol: String, _ label: String) -> some View {
-        Label(label, systemImage: symbol)
-            .font(Font.Soma.dishSmall)
-            .lineLimit(1)
-            .fixedSize()
-            .foregroundStyle(Color.ink)
-            .padding(.horizontal, Theme.Spacing.m)
-            .padding(.vertical, 8)
-            .background(
-                Capsule(style: .continuous)
-                    .stroke(Color.rule, lineWidth: 0.6)
-            )
-    }
-
-    private var transcriptField: some View {
-        ZStack(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: Theme.Radius.indexCard, style: .continuous)
-                .strokeBorder(Color.rule, lineWidth: 0.6)
-
-            if speech.isRecording {
-                // Read-only mirror of the recognizer's output.
-                Text(speech.transcript.isEmpty ? "listening…" : speech.transcript)
-                    .font(Font.Soma.dishNote)
-                    .foregroundStyle(speech.transcript.isEmpty ? Color.inkSoft : Color.ink)
-                    .padding(Theme.Spacing.l)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                TextField("eggs on sourdough, avocado", text: $typed, axis: .vertical)
-                    .font(Font.Soma.dishNote)
-                    .foregroundStyle(Color.ink)
-                    .focused($typedFocused)
-                    .lineLimit(3...6)
-                    .padding(Theme.Spacing.l)
-            }
-        }
-        .frame(minHeight: 120)
-    }
-
-    private var actionRow: some View {
-        HStack(spacing: Theme.Spacing.m) {
-            Button {
-                Task {
-                    if speech.isRecording {
-                        speech.stop()
-                        typed = speech.transcript
-                    } else {
-                        typedFocused = false
-                        speech.reset()
-                        await speech.start()
-                    }
-                }
-            } label: {
-                Label(
-                    speech.isRecording ? "stop" : "speak",
-                    systemImage: speech.isRecording ? "stop.circle" : "mic"
-                )
-                .font(Font.Soma.buttonLg)
-                .foregroundStyle(Color.ink)
-                .padding(.horizontal, Theme.Spacing.l)
-                .padding(.vertical, 12)
-                .background(
-                    Capsule(style: .continuous)
-                        .stroke(Color.ink, lineWidth: 1)
-                )
-            }
-            .buttonStyle(.plain)
-
-            Spacer()
-
-            Button {
-                // Capture before stop() — stopping flips isRecording, which
-                // would swap workingText back to the stale typed field.
-                let payload = workingText.trimmingCharacters(in: .whitespacesAndNewlines)
-                let fromVoice = speech.isRecording ||
-                    (!speech.transcript.isEmpty &&
-                     payload == speech.transcript.trimmingCharacters(in: .whitespacesAndNewlines))
-                speech.stop()
-                guard !payload.isEmpty else { return }
-                onSubmit(payload, fromVoice ? .voice : .manual)
-            } label: {
-                Text("send")
-                    .font(Font.Soma.buttonLg)
-                    .foregroundStyle(Color.paper)
-                    .padding(.horizontal, Theme.Spacing.xl)
-                    .padding(.vertical, 12)
-                    .background(
-                        Capsule(style: .continuous)
-                            .fill(canSubmit ? Color.ink : Color.inkSoft.opacity(0.4))
-                    )
-            }
-            .buttonStyle(.plain)
-            .disabled(!canSubmit)
-        }
-    }
-
-    private func stampedTime() -> String {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        return f.string(from: Date()).uppercased()
-    }
-}
-
-// MARK: - Repeat-a-meal chip strip
-// Small horizontal chips of recently-eaten dishes. Tapping inserts a
-// pending meal with source='repeat', copying the dish's dish_name so the
-// insight engine can attribute the repeat correctly.
-
-private struct RepeatStrip: View {
-    let dishes: [String]
-    var onRepeat: (String) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-            Text("a familiar one")
-                .font(Font.Soma.margin)
-                .foregroundStyle(Color.inkSoft)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: Theme.Spacing.s) {
-                    ForEach(dishes, id: \.self) { dish in
-                        Button {
-                            onRepeat(dish)
-                        } label: {
-                            Text(dish)
-                                .font(Font.Soma.dishSmall)
-                                .foregroundStyle(Color.ink)
-                                .padding(.horizontal, Theme.Spacing.m)
-                                .padding(.vertical, 8)
-                                .background(
-                                    Capsule(style: .continuous)
-                                        .stroke(Color.rule, lineWidth: 0.6)
-                                )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-    }
-}
 
 #Preview {
     TodayView()
