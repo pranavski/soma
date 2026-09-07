@@ -159,7 +159,7 @@ Return EXACTLY this JSON shape, with no prose, no markdown, no code fences:
 }
 
 Rules:
-- dish_name: short lowercase natural label using the dish's native name where possible (e.g. "dal makhani with jeera rice", "pho bo", "shakshuka"), no trailing punctuation. Do NOT translate ethnic names into generic English ("curry", "stew", "rice bowl") when a specific name exists.
+- dish_name: short lowercase natural label using the dish's native name where possible (e.g. "dal makhani with jeera rice", "pho bo", "shakshuka"), no trailing punctuation. Do NOT translate ethnic names into generic English ("curry", "stew", "rice bowl") when a specific name exists. When the input names the restaurant, chain, or brand the food came from, keep that name in dish_name ("grilled cheese from starbucks", "double-double from in-n-out"): the same dish from two kitchens is two different meals.
 - cuisine: one of the enum values above. Use "western" only when the dish is clearly European or American in origin. When unsure between two, pick the one that best matches the dish's native name.
 - calories_low / calories_high: integer kcal estimate for the WHOLE meal. calories_high > calories_low. Range must honor uncertainty — span at least ~25% of the midpoint (e.g. 520–680, not 600–610).
 - protein/carbs/fat/fiber _g_low/_high: integer gram estimates for the WHOLE meal, same ~25%-of-midpoint uncertainty rule. high >= low. Use 0/0 only when the nutrient is genuinely absent.
@@ -449,7 +449,18 @@ async function callClaude(
   const payload = await postMessages(apiKey, {
     model: ANTHROPIC_MODEL,
     max_tokens: 1024,
-    system: SYSTEM_PROMPT,
+    // The system prompt is ~5k characters and byte-identical on every
+    // call, so it is marked as a cache prefix: after the first parse in a
+    // five-minute window every further parse reads it from cache instead
+    // of paying for it again. Everything that varies per call — the
+    // user's corrections, community aliases, anchors, the transcript —
+    // sits in the user message, after the breakpoint, where it belongs.
+    // Sonnet 4.6 caches prefixes of 1024 tokens or more; if this prompt
+    // is ever trimmed below that, caching silently stops (check
+    // usage.cache_read_input_tokens in the function logs).
+    system: [
+      { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+    ],
     messages: [{ role: "user", content: buildUserMessage(transcript, ctx) }],
   }, CLAUDE_TIMEOUT_MS);
   if (!payload) return null;
