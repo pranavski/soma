@@ -5,6 +5,9 @@ import UIKit
 @MainActor
 final class TodayViewModel: ObservableObject {
     @Published private(set) var meals: [Meal] = []
+    /// Yesterday's cards, for the wax-paper compare. Best-effort like the
+    /// repeat chips — an empty list just hides the "compare" pill.
+    @Published private(set) var mealsYesterday: [Meal] = []
     @Published private(set) var recentDishes: [String] = []
     @Published private(set) var isLoading = false
     @Published private(set) var errorText: String?
@@ -43,11 +46,25 @@ final class TodayViewModel: ObservableObject {
         #if DEBUG
         if ProcessInfo.processInfo.environment["SOMA_PREVIEW"] == "1" {
             self.meals = SampleData.logged
+            self.mealsYesterday = SampleData.loggedYesterday
         }
         #endif
     }
 
+    /// True in screenshot mode, where `load()` must not replace the sample
+    /// data with a real (empty) fetch.
+    private static var isPreview: Bool {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["SOMA_PREVIEW"] == "1"
+        #else
+        return false
+        #endif
+    }
+
     func load() async {
+        // Screenshot mode keeps its sample cards; a real fetch would replace
+        // them with an empty day.
+        guard !Self.isPreview else { return }
         // Only show the loading flash on a cold load; refreshes happen quietly.
         if meals.isEmpty {
             isLoading = true
@@ -59,9 +76,12 @@ final class TodayViewModel: ObservableObject {
         } catch {
             errorText = error.localizedDescription
         }
-        // Recent dishes and check-in status are best-effort — a failure here
-        // shouldn't blank the Today screen.
+        // Recent dishes, yesterday's cards and check-in status are
+        // best-effort — a failure here shouldn't blank the Today screen.
         recentDishes = (try? await repository.fetchRecentDishNames(limit: 5)) ?? []
+        if let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now) {
+            mealsYesterday = (try? await repository.fetchToday(on: yesterday)) ?? []
+        }
         do {
             let existing = try await checkins.fetch(on: Date())
             needsCheckin = existing == nil

@@ -1,9 +1,13 @@
 import SwiftUI
 
-/// The signature gesture — drag down from the top of Today (or tap the
-/// compare pill) to lay yesterday over today as a translucent wax-paper
-/// sheet. Yesterday's cards ghost through at ~55% opacity; today's ink
-/// desaturates slightly beneath.
+/// The signature move — tap "compare" in the Today header to lay
+/// yesterday over today as a translucent wax-paper sheet. Yesterday's
+/// cards ghost through at ~55% opacity; tap "lift" (or the sheet's own
+/// tab) to peel it back off.
+///
+/// A pull-down gesture was the original idea, but Today's scroll view
+/// already answers a pull with a refresh, so the pill is the entry point.
+/// With Reduce Motion on, the sheet appears and lifts without animation.
 ///
 /// This is the "could only be Soma" move. Overlay materials are
 /// everywhere in a kitchen (parchment, wax paper, deli sheets) and
@@ -12,8 +16,8 @@ struct WaxPaperOverlay: View {
     let mealsYesterday: [Meal]
     /// 0 = wax paper is lifted (invisible), 1 = fully stuck.
     let progress: Double
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Tapping the tab at the top of the sheet peels it off.
+    var onLift: () -> Void = {}
 
     var body: some View {
         // Progress under a threshold is invisible — no draw cost.
@@ -38,36 +42,42 @@ struct WaxPaperOverlay: View {
                     .blendMode(.multiply)
                     .allowsHitTesting(false)
 
-                VStack(spacing: 0) {
-                    WaxTab(progress: progress)
+                // Scrolls, because a full day is often taller than the
+                // screen and the sheet has to show all of it.
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 0) {
+                        Button(action: onLift) {
+                            WaxTab(progress: progress)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Lift the wax paper")
                         .padding(.top, Theme.Spacing.xxl + 10)
                         .padding(.bottom, Theme.Spacing.m)
 
-                    // Yesterday's cards — ghosted, slightly desaturated.
-                    // They ride the same margin as today's card stream so
-                    // the eye reads them as the *previous version of the
-                    // same day.*
-                    // NOTE: The wax-paper overlay is retired from TodayView;
-                    // this file remains but is unreachable. Kept compiling
-                    // against the simplified RecipeCard so nothing else
-                    // breaks — safe to delete this component in a followup.
-                    VStack(spacing: Theme.Spacing.l) {
-                        ForEach(mealsYesterday, id: \.id) { meal in
-                            RecipeCard(
-                                timeLabel: meal.timeLabel,
-                                dishName: meal.displayName,
-                                calorieRange: meal.calorieRange,
-                                aside: "yesterday",
-                                glyph: FoodGlyph.from(meal.displayName)
-                            )
-                            .opacity(0.82)
-                            .saturation(0.75)
+                        // Yesterday's cards — ghosted, slightly desaturated.
+                        // They ride the same margin as today's card stream
+                        // so the eye reads them as the *previous version of
+                        // the same day.*
+                        VStack(spacing: Theme.Spacing.l) {
+                            ForEach(mealsYesterday, id: \.id) { meal in
+                                RecipeCard(
+                                    timeLabel: meal.timeLabel,
+                                    dishName: meal.displayName,
+                                    calorieRange: meal.calorieRange,
+                                    macros: meal.macros,
+                                    detail: meal.stimulantNote,
+                                    aside: "yesterday",
+                                    glyph: FoodGlyph.from(meal.displayName)
+                                )
+                                .opacity(0.82)
+                                .saturation(0.75)
+                            }
                         }
-                    }
-                    .padding(.horizontal, Theme.Spacing.xl)
-                    .opacity(progress)
+                        .padding(.horizontal, Theme.Spacing.xl)
+                        .opacity(progress)
 
-                    Spacer(minLength: 0)
+                        Spacer(minLength: Theme.TabBar.scrollBottomInset)
+                    }
                 }
             }
             .allowsHitTesting(progress > 0.5)

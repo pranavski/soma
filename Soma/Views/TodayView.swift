@@ -27,7 +27,19 @@ struct TodayView: View {
     /// Meal the card menu asked to remove, awaiting confirmation. Held
     /// here rather than on the card for the reason in `MealCardActions`.
     @State private var deletingMeal: Meal?
+    /// 0 = wax paper lifted, 1 = yesterday laid over today. Driven by the
+    /// "compare" pill in the header; see `WaxPaperOverlay`.
+    @State private var waxProgress: Double = {
+        #if DEBUG
+        // Same family as SOMA_PREVIEW_SHEET: a headless run can open the
+        // wax paper for a screenshot.
+        return ProcessInfo.processInfo.environment["SOMA_PREVIEW_COMPARE"] == "1" ? 1 : 0
+        #else
+        return 0
+        #endif
+    }()
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ZStack {
@@ -35,7 +47,12 @@ struct TodayView: View {
 
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: Theme.Spacing.xl) {
-                    HeaderBlock(date: vm.now)
+                    HeaderBlock(
+                        date: vm.now,
+                        // Nothing to lay over today if yesterday has no cards.
+                        compare: vm.mealsYesterday.isEmpty ? nil : toggleWaxPaper,
+                        isComparing: waxProgress > 0.5
+                    )
                         .padding(.top, Theme.Spacing.l)
                         .padding(.horizontal, Theme.Spacing.xl)
 
@@ -77,6 +94,14 @@ struct TodayView: View {
                 guard phase == .active else { return }
                 Task { await vm.load() }
             }
+
+            // Yesterday, laid over today. Sits under the capture pill so
+            // "tell me" stays reachable with the sheet down.
+            WaxPaperOverlay(
+                mealsYesterday: vm.mealsYesterday,
+                progress: waxProgress,
+                onLift: toggleWaxPaper
+            )
 
             VStack {
                 Spacer()
@@ -126,6 +151,19 @@ struct TodayView: View {
             .presentationDragIndicator(.visible)
         }
     }
+
+    /// Lay the wax paper down or peel it off. A soft spring, or a cut when
+    /// the person has asked for less motion.
+    private func toggleWaxPaper() {
+        let target: Double = waxProgress > 0.5 ? 0 : 1
+        if reduceMotion {
+            waxProgress = target
+        } else {
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
+                waxProgress = target
+            }
+        }
+    }
 }
 
 // MARK: - Quiet-check nudge
@@ -160,16 +198,27 @@ private struct CheckinNudge: View {
 }
 
 // MARK: - Header
-// Single left-aligned row: weekday/date line + logo. Nothing on the right.
+// Left-aligned: weekday/date line + logo. The only thing on the right is
+// the "compare" pill, and only when yesterday has cards to lay over today.
 
 private struct HeaderBlock: View {
     let date: Date
+    /// Nil hides the pill.
+    var compare: (() -> Void)? = nil
+    var isComparing: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-            Text(SomaFormat.longDay(date))
-                .font(Font.Soma.dateLabel)
-                .foregroundStyle(Color.inkSoft)
+            HStack(alignment: .firstTextBaseline) {
+                Text(SomaFormat.longDay(date))
+                    .font(Font.Soma.dateLabel)
+                    .foregroundStyle(Color.inkSoft)
+                Spacer(minLength: Theme.Spacing.m)
+                if let compare {
+                    WaxPaperToggleButton(isOn: isComparing, action: compare)
+                        .accessibilityLabel(isComparing ? "Lift yesterday off today" : "Compare with yesterday")
+                }
+            }
 
             HStack(spacing: 0) {
                 Text("Soma")
