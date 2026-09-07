@@ -22,19 +22,39 @@ import SwiftUI
 /// changes (a new recipient, a new kind of data), bump the version: the old
 /// answer stops covering it and everyone is asked again. 5.1.2(i) is
 /// explicit that a privacy-policy mention doesn't stand in for asking.
+///
+/// **The answer is also written to the server.** The nightly look-back runs
+/// server-side with no phone in the loop, so `generate-insights` and the
+/// cron that enqueues it read the `ai_consent` row, not UserDefaults. Every
+/// accept/decline is pushed through `publish`, and `syncToServer()` re-pushes
+/// the current answer on sign-in so a write that failed offline heals.
+/// Until the row says yes, the server treats the person as declined.
 @MainActor
 final class AIDisclosure: ObservableObject {
-    static let shared = AIDisclosure()
+    /// Pushes a decision to the server. Injected so tests never touch the
+    /// network; the shared instance writes through `AIConsentRepository`.
+    typealias Publisher = @Sendable (Bool) async throws -> Void
 
-    private static let key = "soma.ai.parseConsent.v1"
+    static let shared = AIDisclosure(publish: { consented in
+        try await AIConsentRepository().set(consented: consented)
+    })
+
+    /// Version of the described flow. Shared with the UserDefaults key, the
+    /// `ai_consent.consent_version` column and `generate-insights`; a wider
+    /// flow bumps it everywhere and everyone is asked again.
+    static let consentVersion = "v1"
+
+    private static let key = "soma.ai.parseConsent.\(consentVersion)"
 
     /// nil = never answered (show the sheet), true = agreed, false = declined.
     @Published private(set) var decision: Bool?
 
     private let defaults: UserDefaults
+    private let publish: Publisher?
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, publish: Publisher? = nil) {
         self.defaults = defaults
+        self.publish = publish
         self.decision = defaults.object(forKey: Self.key) as? Bool
     }
 
@@ -44,17 +64,42 @@ final class AIDisclosure: ObservableObject {
     func accept() {
         decision = true
         defaults.set(true, forKey: Self.key)
+        push(true)
     }
 
     func decline() {
         decision = false
         defaults.set(false, forKey: Self.key)
+        push(false)
     }
 
     /// Settings offers a way back — consent has to be revocable to be real.
+    /// Local only: sign-out calls this, and the server row belongs to the
+    /// account, not the phone. It is rewritten the next time that account
+    /// answers or signs in.
     func reset() {
         decision = nil
         defaults.removeObject(forKey: Self.key)
+    }
+
+    /// Re-push the current answer. Called once per sign-in; idempotent.
+    func syncToServer() {
+        guard let decision else { return }
+        push(decision)
+    }
+
+    private func push(_ consented: Bool) {
+        guard let publish else { return }
+        Task {
+            do {
+                try await publish(consented)
+            } catch {
+                // Retried on the next sign-in. A failed decline is the case
+                // that matters: the server keeps the previous answer until
+                // then, so say so in the log rather than swallowing it.
+                print("AIDisclosure: consent sync failed — \(error.localizedDescription)")
+            }
+        }
     }
 }
 
@@ -127,7 +172,7 @@ struct AIDisclosureSheet: View {
     private var bullets: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.s) {
             row(sent: true,  "what you typed or said about a meal")
-            row(sent: true,  "daily totals — sleep, steps, resting heart rate, HRV, weight — for the nightly look-back")
+            row(sent: true,  "daily totals — sleep, steps, resting heart rate, HRV, weight, active energy, workout minutes — for the nightly look-back")
             row(sent: false, "your name, email, or account id")
             row(sent: false, "raw Apple Health samples — only the daily totals, never the readings behind them")
             row(sent: false, "your recordings — audio never leaves the phone")

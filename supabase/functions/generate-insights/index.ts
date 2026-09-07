@@ -18,6 +18,7 @@
 // Response (`candidates` is the shortlist size, so a zero-insight run says
 // whether the statistics found nothing or the model declined what it saw):
 //   200 { surfaced, inserted, candidates, reflections }           — ran
+//   200 { surfaced: false, reason: "no_ai_consent", reflections }     — no consented ai_consent row; model never called
 //   200 { surfaced: false, reason: "insufficient_data", reflections } — gated before scoring
 //   200 { surfaced: false, reason: "no_qualifying_patterns", candidates, reflections } — nothing survived, or nothing chosen
 //   429 { error: "too_soon", retry_after_seconds }                — user path only, see below
@@ -47,6 +48,14 @@
 // this run: a higher confidence tier and a line telling the model how long
 // it has held. That memory only ever adds evidence. It never changes which
 // hypotheses are tested, their p-values, or what clears the correction.
+//
+// Consent gate. Guideline 5.1.2(i): nothing goes to third-party AI without
+// explicit in-app permission. The app records that answer in ai_consent
+// (see the migration of the same name); the cron fan-out only enqueues
+// consented users, and this function re-checks so an on-demand pull, a
+// stale cron row, or a hand-made request can't route around it. Absence
+// of a row is a no. Reflections still run — they are templated and never
+// leave the database.
 //
 // Secrets required:
 //   ANTHROPIC_API_KEY
@@ -85,6 +94,9 @@ import { type Reflection, buildReflections } from "./reflections.ts";
 // pleading from the prompt.
 const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const WINDOW_DAYS = 30;
+/// Must match `AIDisclosure`'s key suffix on the client and the migration
+/// default. Widening what is sent bumps all three.
+const AI_CONSENT_VERSION = "v1";
 const RECENT_CLAIMS_LIMIT = 15;
 
 /// Minimum gap between two user-initiated runs for the same person.
@@ -200,6 +212,21 @@ async function loadWindow(admin: SupabaseClient, userId: string) {
     checkins: (checkins.data ?? []) as CheckinRow[],
     health: (health.data ?? []) as HealthDayRow[],
   };
+}
+
+/// True only for a row that says yes to the flow this build describes.
+/// A read failure is a no: this guard protects the user, not the feed.
+async function hasAIConsent(admin: SupabaseClient, userId: string): Promise<boolean> {
+  const { data, error } = await admin
+    .from("ai_consent")
+    .select("consented,consent_version")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) {
+    console.error(`generate-insights: ai_consent read failed — ${error.message}`);
+    return false;
+  }
+  return data?.consented === true && data?.consent_version === AI_CONSENT_VERSION;
 }
 
 // ─── Pattern history ────────────────────────────────────────────────────────
@@ -531,7 +558,10 @@ serve(async (req) => {
     return json(429, { error: "too_soon", retry_after_seconds: retryAfter });
   }
 
-  const { meals, checkins, health } = await loadWindow(admin, userId);
+  const [{ meals, checkins, health }, consented] = await Promise.all([
+    loadWindow(admin, userId),
+    hasAIConsent(admin, userId),
+  ]);
   const { lines, coverage } = buildDigest(meals, checkins, health);
 
   // Before the gate, and on every run rather than only on gated ones. The
@@ -541,6 +571,17 @@ serve(async (req) => {
   // decides whether to show it (see InsightsViewModel).
   const reflections = buildReflections(meals, checkins, health);
   await writeReflections(admin, userId, reflections);
+
+  // Everything past this point ends in a model call. No consent, no call —
+  // regardless of how much data there is or who invoked the run.
+  if (!consented) {
+    return json(200, {
+      surfaced: false,
+      inserted: 0,
+      reason: "no_ai_consent",
+      reflections: reflections.length,
+    });
+  }
 
   if (!hasSufficientData(coverage)) {
     return json(200, {
