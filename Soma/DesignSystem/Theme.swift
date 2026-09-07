@@ -26,6 +26,18 @@ enum Theme {
         static let nib:      CGFloat = 1.6
     }
 
+    /// Chrome the tab bar owns at the bottom of every signed-in screen.
+    /// `barHeight` is the painted strip above the home indicator; screens
+    /// that pin something (Today's capture pill, Insights' quick-log) sit
+    /// `contentClearance` up from the bottom so they clear the bar instead
+    /// of guessing at a magic number each time.
+    enum TabBar {
+        static let barHeight: CGFloat = 62
+        static let contentClearance: CGFloat = barHeight + Spacing.xl
+        /// Bottom padding for the last element of a scrolling screen.
+        static let scrollBottomInset: CGFloat = contentClearance + Spacing.xxl
+    }
+
     /// 3×5 index card proportions, the spine of the Mise direction.
     enum Card {
         static let aspect: CGFloat = 5.0 / 3.0     // h/w when laid as a portrait card
@@ -35,18 +47,26 @@ enum Theme {
     }
 }
 
-/// Font names of the custom faces we *want* to use. If a name resolves at
-/// runtime (i.e. the .ttf has been dropped into Fonts/ and registered via
-/// UIAppFonts), we use it; otherwise we fall back gracefully so the app
-/// continues to look intentional even before the typeface ships.
-private enum SomaFontName {
-    static let hand        = "Caveat-Regular"          // free, Google Fonts
+/// Font names of the custom faces the design system uses. The files live
+/// in Soma/Fonts and are registered at launch by `SomaFonts` (CoreText, not
+/// a plist key — see that file); if a name ever stops resolving (a file
+/// dropped from the target, a renamed face) `customOrFallback` still
+/// degrades to a system face so the app keeps looking intentional — and
+/// `BundledFontsTests` fails, so the fallback can't ship unnoticed again.
+///
+/// Fraunces is bundled as its two variable files (roman and italic);
+/// "Fraunces-SemiBold" is a named instance of the roman file, which
+/// CoreText exposes under that PostScript name.
+enum SomaFontName {
+    static let hand        = "Caveat-Regular"          // OFL, Google Fonts
     static let handBold    = "Caveat-Bold"
-    static let displayReg  = "Fraunces-Regular"        // free, Google Fonts
+    static let displayReg  = "Fraunces-Regular"        // OFL, Google Fonts
     static let displayItal = "Fraunces-Italic"
     static let displaySemi = "Fraunces-SemiBold"
-    static let mono        = "IBMPlexMono-Regular"     // free, Google Fonts
+    static let mono        = "IBMPlexMono-Regular"     // OFL, Google Fonts
     static let monoMed     = "IBMPlexMono-Medium"
+
+    static let all = [hand, handBold, displayReg, displayItal, displaySemi, mono, monoMed]
 }
 
 private func customOrFallback(_ name: String, size: CGFloat, fallback: Font) -> Font {

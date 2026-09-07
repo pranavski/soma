@@ -1,25 +1,14 @@
 // parse-meal
 //
-// Takes a meal row id + either a photo path or a voice transcript,
-// asks Claude to extract structured items + dish name + calorie range,
-// writes the result back into `meals` and `meal_items`.
-//
-// Photo branch: the image (private `meal-photos` bucket, path
-// `<user_id>/<meal_id>.<ext>`) is downloaded with the service role and
-// run through a hosted object-detection model (Roboflow). The detected
-// labels are rendered as a transcript-shaped input and fed to the SAME
-// Claude step as voice — detection augments the existing reasoning layer,
-// it does not replace it. Raw detections persist to `meals.detections`
-// for auditing and threshold tuning. Any detection failure (missing
-// config, download error, timeout, zero confident labels) lands on the
-// same 422 fallback as a Claude failure — the row flips to 'failed' and
-// the client's manual-correction path takes over.
+// Takes a meal row id + a voice/typed transcript, asks Claude to extract
+// structured items + dish name + calorie range, writes the result back
+// into `meals` and `meal_items`.
 //
 // Contract (request):
-//   { meal_id: uuid, photo_path?: string, voice_transcript?: string }
+//   { meal_id: uuid, voice_transcript: string }
 // Contract (success 200):
 //   { dish_name, cuisine, calories_low, calories_high, items: [{name, quantity}], ... }
-// Contract (Claude/detection failure 422):
+// Contract (Claude failure 422):
 //   { fallback: { dish_name: null, cuisine: null, calories_low: null, ... } }
 //
 // Retrieval-augmented: before calling Claude, we fetch this user's last ~20
@@ -29,34 +18,34 @@
 // to the user (via RLS on meal_corrections) while sharing benign
 // canonical-name → alias mappings across the community (dish_aliases).
 //
+// Menu-aware: when the transcript names a restaurant, chain, or packaged
+// brand (see venue.ts), the prompt tells Claude which operator's product
+// this is, so "grilled cheese from starbucks" is priced off Starbucks'
+// published item rather than a generic sandwich, and keeps the operator in
+// dish_name so it never collapses into In-N-Out's. This is prompt context
+// only — no tool, no search, nothing leaves Anthropic — and it is absent
+// for home cooking, which is most meals.
+//
 // Secrets required (set via `supabase secrets set ...`):
 //   ANTHROPIC_API_KEY
-//   ROBOFLOW_API_KEY              (photo branch)
-//   ROBOFLOW_MODEL_ID             (photo branch, e.g. "food-detection-xxxx/1")
-//   ROBOFLOW_ENDPOINT             (optional, default https://serverless.roboflow.com)
-//   ROBOFLOW_MIN_CONFIDENCE       (optional, default 0.4)
 //   SUPABASE_URL                  (auto-injected)
 //   SUPABASE_ANON_KEY             (auto-injected)
 //   SUPABASE_SERVICE_ROLE_KEY     (auto-injected)
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 import {
   createClient,
   type SupabaseClient,
 } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-import {
-  type RoboflowPrediction,
-  detectionTranscript,
-  parsePredictions,
-  summarizeDetections,
-} from "./detection.ts";
+import { matchAnchors, matchFdcEntries, renderAnchors } from "./fdc.ts";
+import { detectVenues, renderVenueContext } from "./venue.ts";
 
 const ANTHROPIC_MODEL = "claude-sonnet-4-6";
 
+const CLAUDE_TIMEOUT_MS = 20_000;
+
 type ParseRequest = {
   meal_id: string;
-  photo_path?: string | null;
   voice_transcript?: string | null;
 };
 
@@ -69,6 +58,17 @@ type MacroRange = {
   fat_g_high: number;
   fiber_g_low: number;
   fiber_g_high: number;
+};
+
+/// Caffeine and alcohol sit outside MacroRange deliberately. They are not
+/// macronutrients, they are anchored against a reference table rather than
+/// estimated freehand (see fdc.ts), and the insight engine reads them
+/// through time windows the macros have no equivalent of.
+type StimulantRange = {
+  caffeine_mg_low: number;
+  caffeine_mg_high: number;
+  alcohol_g_low: number;
+  alcohol_g_high: number;
 };
 
 type Cuisine =
@@ -104,7 +104,7 @@ type ParsedMeal = {
   calories_low: number;
   calories_high: number;
   items: ParsedItem[];
-} & MacroRange;
+} & MacroRange & StimulantRange;
 
 const FALLBACK = {
   fallback: {
@@ -120,6 +120,10 @@ const FALLBACK = {
     fat_g_high: null,
     fiber_g_low: null,
     fiber_g_high: null,
+    caffeine_mg_low: null,
+    caffeine_mg_high: null,
+    alcohol_g_low: null,
+    alcohol_g_high: null,
     items: [] as ParsedItem[],
   },
 };
@@ -143,6 +147,8 @@ Return EXACTLY this JSON shape, with no prose, no markdown, no code fences:
   "carbs_g_low":   integer, "carbs_g_high":   integer,
   "fat_g_low":     integer, "fat_g_high":     integer,
   "fiber_g_low":   integer, "fiber_g_high":   integer,
+  "caffeine_mg_low": integer, "caffeine_mg_high": integer,
+  "alcohol_g_low":   integer, "alcohol_g_high":   integer,
   "items": [{
     "name": string, "quantity": string | null,
     "protein_g_low": integer, "protein_g_high": integer,
@@ -153,10 +159,11 @@ Return EXACTLY this JSON shape, with no prose, no markdown, no code fences:
 }
 
 Rules:
-- dish_name: short lowercase natural label using the dish's native name where possible (e.g. "dal makhani with jeera rice", "pho bo", "shakshuka"), no trailing punctuation. Do NOT translate ethnic names into generic English ("curry", "stew", "rice bowl") when a specific name exists.
+- dish_name: short lowercase natural label using the dish's native name where possible (e.g. "dal makhani with jeera rice", "pho bo", "shakshuka"), no trailing punctuation. Do NOT translate ethnic names into generic English ("curry", "stew", "rice bowl") when a specific name exists. When the input names the restaurant, chain, or brand the food came from, keep that name in dish_name ("grilled cheese from starbucks", "double-double from in-n-out"): the same dish from two kitchens is two different meals.
 - cuisine: one of the enum values above. Use "western" only when the dish is clearly European or American in origin. When unsure between two, pick the one that best matches the dish's native name.
 - calories_low / calories_high: integer kcal estimate for the WHOLE meal. calories_high > calories_low. Range must honor uncertainty — span at least ~25% of the midpoint (e.g. 520–680, not 600–610).
 - protein/carbs/fat/fiber _g_low/_high: integer gram estimates for the WHOLE meal, same ~25%-of-midpoint uncertainty rule. high >= low. Use 0/0 only when the nutrient is genuinely absent.
+- caffeine_mg_low / caffeine_mg_high: integer milligrams of caffeine in the WHOLE meal. alcohol_g_low / alcohol_g_high: integer grams of pure ethanol in the WHOLE meal. Use 0/0 — not a guess — when the meal plainly contains neither, which is most meals. When reference values are supplied below, base these on them and multiply by the number of servings described; do not estimate from memory. These two ranges may be tighter than 25% of the midpoint, because a standard serving is a known quantity.
 - items: 1–6 short component names with per-item macro ranges. quantity is a short string like "1 cup" or "2 slices", or null if unstated. Item macros should roughly sum to meal totals.
 - If the input is vague, still produce your best guess. Do NOT refuse.
 
@@ -229,6 +236,27 @@ function isMacroRangeOk(o: Record<string, unknown>, itemLevel: boolean): boolean
   return true;
 }
 
+/// Caffeine and alcohol are meal-level only — a per-item breakdown would be
+/// noise, since these come from one identifiable component or none.
+///
+/// Unlike the macros these are required and must be non-negative: "no
+/// caffeine" has to be an explicit 0, not an omission. The insight engine
+/// distinguishes a parsed zero from an unparsed null (see the anyParsed
+/// guard in candidates.ts), and letting the model omit the field would make
+/// every meal it forgot look like an unparsed one.
+function isStimulantRangeOk(o: Record<string, unknown>): boolean {
+  const pairs: [string, string][] = [
+    ["caffeine_mg_low", "caffeine_mg_high"],
+    ["alcohol_g_low", "alcohol_g_high"],
+  ];
+  for (const [lo, hi] of pairs) {
+    if (!Number.isInteger(o[lo]) || !Number.isInteger(o[hi])) return false;
+    if ((o[lo] as number) < 0) return false;
+    if ((o[hi] as number) < (o[lo] as number)) return false;
+  }
+  return true;
+}
+
 function isCuisine(x: unknown): x is Cuisine {
   return typeof x === "string" && (CUISINE_VALUES as string[]).includes(x);
 }
@@ -243,6 +271,7 @@ function isParsedMeal(x: unknown): x is ParsedMeal {
   const hi = o.calories_high as number;
   if (lo <= 0 || hi <= lo) return false;
   if (!isMacroRangeOk(o, false)) return false;
+  if (!isStimulantRangeOk(o)) return false;
   if (!Array.isArray(o.items)) return false;
   for (const it of o.items as unknown[]) {
     if (!it || typeof it !== "object") return false;
@@ -350,8 +379,64 @@ function buildUserMessage(
         ctx.aliasLines.join("\n"),
     );
   }
+  // Reference values for any caffeinated or alcoholic item named in the
+  // transcript. Matched here, before the single Claude call, rather than
+  // against the parsed item names — those do not exist yet, and looking them
+  // up afterwards would cost a second round trip on the logging path.
+  const anchorBlock = renderAnchors(matchAnchors(transcript));
+  if (anchorBlock.length > 0) blocks.push(anchorBlock);
+
+  // Supplementary per-100g composition, when the committed FDC extract has
+  // anything relevant. Absent by default — see fdc.ts.
+  const fdcMatches = matchFdcEntries(transcript);
+  if (fdcMatches.length > 0) {
+    blocks.push(
+      "USDA FoodData Central composition per 100 g, for reference:\n" +
+        fdcMatches.map((e) =>
+          `- ${e.description}: ` +
+          Object.entries(e.per_100g).map(([k, v]) => `${k} ${v}`).join(", ")
+        ).join("\n"),
+    );
+  }
+
+  // The operator, when the transcript named one. Absent for home cooking.
+  const venueBlock = renderVenueContext(detectVenues(transcript));
+  if (venueBlock.length > 0) blocks.push(venueBlock);
+
   blocks.push(`Input: ${transcript}`);
   return blocks.join("\n\n");
+}
+
+type ContentBlock = { type?: string; text?: string };
+type ClaudePayload = { content?: ContentBlock[] };
+
+async function postMessages(
+  apiKey: string,
+  body: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<ClaudePayload | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    return await res.json() as ClaudePayload;
+  } catch {
+    // Timeout, abort, network error, or unparseable body — all the same to
+    // the caller, which has a fallback either way.
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function callClaude(
@@ -360,34 +445,28 @@ async function callClaude(
 ): Promise<ParsedMeal | null> {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
   if (!apiKey) return null;
-  const userMessage = buildUserMessage(transcript, ctx);
-  let res: Response;
-  try {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: userMessage }],
-      }),
-    });
-  } catch {
-    return null;
-  }
-  if (!res.ok) return null;
-  let payload: { content?: { type?: string; text?: string }[] };
-  try {
-    payload = await res.json();
-  } catch {
-    return null;
-  }
-  const text = payload?.content?.find((b) => b?.type === "text")?.text;
+
+  const payload = await postMessages(apiKey, {
+    model: ANTHROPIC_MODEL,
+    max_tokens: 1024,
+    // The system prompt is ~5k characters and byte-identical on every
+    // call, so it is marked as a cache prefix: after the first parse in a
+    // five-minute window every further parse reads it from cache instead
+    // of paying for it again. Everything that varies per call — the
+    // user's corrections, community aliases, anchors, the transcript —
+    // sits in the user message, after the breakpoint, where it belongs.
+    // Sonnet 4.6 caches prefixes of 1024 tokens or more; if this prompt
+    // is ever trimmed below that, caching silently stops (check
+    // usage.cache_read_input_tokens in the function logs).
+    system: [
+      { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+    ],
+    messages: [{ role: "user", content: buildUserMessage(transcript, ctx) }],
+  }, CLAUDE_TIMEOUT_MS);
+  if (!payload) return null;
+
+  const blocks = Array.isArray(payload.content) ? payload.content : [];
+  const text = blocks.find((b) => b?.type === "text")?.text;
   if (typeof text !== "string") return null;
   // Strip accidental ``` fences without growing surface area.
   const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
@@ -398,67 +477,6 @@ async function callClaude(
     return null;
   }
   return isParsedMeal(parsed) ? parsed : null;
-}
-
-// Roboflow hosted-API detection. Model + endpoint stay in env so the
-// model can be swapped without a code change.
-type RoboflowConfig = {
-  apiKey: string;
-  modelId: string;
-  endpoint: string;
-  minConfidence: number;
-};
-
-function roboflowConfig(): RoboflowConfig | null {
-  const apiKey = Deno.env.get("ROBOFLOW_API_KEY");
-  const modelId = Deno.env.get("ROBOFLOW_MODEL_ID");
-  if (!apiKey || !modelId) return null;
-  const endpoint = (Deno.env.get("ROBOFLOW_ENDPOINT") ?? "https://serverless.roboflow.com")
-    .replace(/\/+$/, "");
-  const raw = Number(Deno.env.get("ROBOFLOW_MIN_CONFIDENCE") ?? "0.4");
-  const minConfidence = Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : 0.4;
-  return { apiKey, modelId, endpoint, minConfidence };
-}
-
-const ROBOFLOW_TIMEOUT_MS = 15_000;
-const ROBOFLOW_RETRY_DELAY_MS = 1_000;
-
-/// One retry on timeout / network error / 5xx; 4xx fails immediately
-/// (bad model id or key won't fix itself on a second attempt).
-async function callRoboflow(
-  cfg: RoboflowConfig,
-  imageBase64: string,
-): Promise<RoboflowPrediction[] | null> {
-  const url = `${cfg.endpoint}/${cfg.modelId}?api_key=${encodeURIComponent(cfg.apiKey)}`;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt > 0) {
-      await new Promise((resolve) => setTimeout(resolve, ROBOFLOW_RETRY_DELAY_MS));
-    }
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), ROBOFLOW_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: imageBase64,
-        signal: ctrl.signal,
-      });
-      if (res.status >= 500) continue;
-      if (!res.ok) return null;
-      let payload: unknown;
-      try {
-        payload = await res.json();
-      } catch {
-        return null;
-      }
-      return parsePredictions(payload);
-    } catch {
-      // timeout or network error — fall through to the retry
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  return null;
 }
 
 serve(async (req) => {
@@ -474,10 +492,11 @@ serve(async (req) => {
     return json(400, { error: "invalid_json" });
   }
   if (!body.meal_id) return json(400, { error: "missing_meal_id" });
-  const hasPhoto = typeof body.photo_path === "string" && body.photo_path.length > 0;
-  const hasVoice = typeof body.voice_transcript === "string" && body.voice_transcript.length > 0;
-  if (hasPhoto === hasVoice) {
-    return json(400, { error: "exactly_one_of_photo_path_or_voice_transcript" });
+  const transcript = typeof body.voice_transcript === "string"
+    ? body.voice_transcript.trim()
+    : "";
+  if (transcript.length === 0) {
+    return json(400, { error: "missing_voice_transcript" });
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -497,43 +516,8 @@ serve(async (req) => {
 
   const admin = createClient(supabaseUrl, serviceKey);
 
-  let parsed: ParsedMeal | null = null;
-  // Raw detector output — persisted even when the parse fails, so bad
-  // parses can be audited against what the model actually saw.
-  let detectionRecord: Record<string, unknown> | null = null;
-
-  if (hasVoice) {
-    const ctx = await fetchRetrievalContext(admin, meal.user_id);
-    parsed = await callClaude(body.voice_transcript!, ctx);
-  } else {
-    // The path layout is <user_id>/<meal_id>.<ext>; a path outside the
-    // caller's own folder is an attempt to parse someone else's object.
-    const path = body.photo_path!;
-    if (!path.startsWith(`${meal.user_id}/`)) {
-      return json(403, { error: "photo_path_not_owned" });
-    }
-    const cfg = roboflowConfig();
-    if (cfg) {
-      const { data: file } = await admin.storage.from("meal-photos").download(path);
-      if (file) {
-        const b64 = encodeBase64(new Uint8Array(await file.arrayBuffer()));
-        const predictions = await callRoboflow(cfg, b64);
-        if (predictions) {
-          detectionRecord = {
-            model_id: cfg.modelId,
-            min_confidence: cfg.minConfidence,
-            predictions,
-            detected_at: new Date().toISOString(),
-          };
-          const items = summarizeDetections(predictions, cfg.minConfidence);
-          if (items.length > 0) {
-            const ctx = await fetchRetrievalContext(admin, meal.user_id);
-            parsed = await callClaude(detectionTranscript(items), ctx);
-          }
-        }
-      }
-    }
-  }
+  const ctx = await fetchRetrievalContext(admin, meal.user_id);
+  const parsed = await callClaude(transcript, ctx);
 
   if (!parsed) {
     await admin
@@ -541,7 +525,6 @@ serve(async (req) => {
       .update({
         parse_status: "failed",
         parsed_at: new Date().toISOString(),
-        ...(detectionRecord ? { detections: detectionRecord } : {}),
       })
       .eq("id", meal.id);
     return json(422, FALLBACK);
@@ -563,9 +546,12 @@ serve(async (req) => {
       fat_g_high: parsed.fat_g_high,
       fiber_g_low: parsed.fiber_g_low,
       fiber_g_high: parsed.fiber_g_high,
+      caffeine_mg_low: parsed.caffeine_mg_low,
+      caffeine_mg_high: parsed.caffeine_mg_high,
+      alcohol_g_low: parsed.alcohol_g_low,
+      alcohol_g_high: parsed.alcohol_g_high,
       parse_status: "parsed",
       parsed_at: new Date().toISOString(),
-      ...(detectionRecord ? { detections: detectionRecord } : {}),
     })
     .eq("id", meal.id);
   if (parsed.items.length > 0) {

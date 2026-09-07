@@ -6,11 +6,15 @@ TestFlight/App Store build. Run top to bottom.
 ## 1. Database
 
 ```sh
+supabase migration list   # local and remote columns must match
 supabase db push
 ```
 
-Pushes the one unapplied migration, `20260708120000_add_meal_local_time.sql`
-(adds `meals.eaten_date` / `meals.eaten_hour` + backfill + index). Verify:
+Pushes whatever is unapplied. As of 2026-09-07 that is the two newest
+migrations: `20260907120000_insights_read_only_for_clients.sql` (drops the
+client write policies on `insights`) and
+`20260907120100_create_insight_runs.sql` (the per-user throttle table
+`generate-insights` reads). Verify:
 
 ```sh
 supabase db diff        # should be empty
@@ -48,7 +52,7 @@ cron bearer secret, not a user JWT) — `config.toml` already carries
 `[functions.generate-insights] verify_jwt = false`, and the flag makes it
 explicit on deploy.
 
-## 4. Vault secrets for the weekly cron
+## 4. Vault secrets for the nightly cron
 
 In the SQL editor (values must match step 2/3):
 
@@ -63,8 +67,9 @@ select vault.create_secret(
 );
 ```
 
-Then confirm the job exists: `select * from cron.job;` — expect the weekly
-Monday 06:00 UTC `generate-insights` fan-out.
+Then confirm the job exists: `select * from cron.job;` — expect the nightly
+03:30 UTC `generate-insights` fan-out (one POST per user with a meal in the
+last 30 days; migration `20260720120200`).
 
 ## 5. Supabase Auth — Apple provider
 
@@ -74,16 +79,19 @@ Dashboard → Authentication → Providers → Apple:
 
 ## 6. App Store Connect
 
-- **Privacy policy URL** — host `docs/privacy-policy.md` (any static page)
-  and set the URL in ASC. Required before submission.
+- **Privacy policy URL** — host `docs/privacy-policy.md` (GitHub Pages is
+  the plan), set the URL in ASC, then point `SomaFeatures.privacyPolicyURL`
+  at it and flip `SomaFeatures.privacyPolicyIsHosted`. Required before
+  submission.
+- **Support URL / email** — `SomaFeatures.supportEmail`.
 - **App privacy nutrition labels** — declare exactly what
   `PrivacyInfo.xcprivacy` declares: Health & Fitness, Other User Content,
-  User ID, Other Diagnostic Data — all "linked to you", none "tracking".
-- **App icon** — still outstanding (deliberately skipped); the appiconset
-  is empty and Xcode will refuse to archive for distribution without a
-  1024pt marketing icon.
+  User ID, Email, Other Diagnostic Data — all "linked to you", none
+  "tracking". See docs/app-store-compliance.md §2.
+- **App icon** — present; `DesignAssets/build-assets.sh` regenerates it
+  from the master PNG.
 - Screenshots: iPhone only (the target is iPhone-only, portrait-only).
-  Do not show or mention photo logging — it's deferred to v1.1.
+  Do not show or mention photo logging — it is not in this version.
 
 ## 7. Xcode / signing sanity
 
@@ -103,8 +111,11 @@ Dashboard → Authentication → Providers → Apple:
 5. Settings → delete account → complete the Apple prompt → confirm all
    rows gone and sign-in state cleared; then cancel-path: delete again on
    a second account, dismiss the Apple prompt, deletion must still finish.
-6. Invoke `generate-insights` manually with the cron secret and confirm a
-   422/insight/empty-state behaves per spec:
+6. Pull to refresh on the Noticed tab twice in a row: the second pull
+   should show "thought it over a few minutes ago" (the 429 throttle),
+   not a failure.
+7. Invoke `generate-insights` manually with the cron secret and confirm the
+   insufficient-data / insight / empty-state responses behave per spec:
    ```sh
    curl -X POST https://<ref>.supabase.co/functions/v1/generate-insights \
      -H "Authorization: Bearer $INSIGHTS_CRON_SECRET" \

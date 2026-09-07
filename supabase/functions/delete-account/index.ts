@@ -5,12 +5,15 @@
 // finally deletes the auth user itself so no orphaned row can identify them.
 //
 // Order matters:
-//   1. Delete owned rows (meal_corrections, app_feedback, meals cascades
-//      to meal_items, daily_checkins, health_days, insights). The
-//      `on delete cascade` FKs to auth.users MEAN step 2 alone would do
+//   1. Purge the caller's storage objects. Storage rows do not cascade
+//      from auth.users, so this is the one step nothing else would do.
+//   2. Delete owned rows in every user-keyed table (the list below). The
+//      `on delete cascade` FKs to auth.users MEAN step 3 alone would do
 //      the cleanup — but doing it explicitly here gives us a clear error
-//      surface if a future table forgot to add the FK.
-//   2. Delete the auth.users row via admin API. Only the service role
+//      surface if a future table forgot to add the FK. Keep the list in
+//      step with the schema: a table missing here is a table whose
+//      deletion is trusted to a cascade nobody has checked.
+//   3. Delete the auth.users row via admin API. Only the service role
 //      can do this; that's why this must be an Edge Function.
 //
 // Contract (request): { authorization_code?: string } (auth via bearer
@@ -20,7 +23,10 @@
 // Contract (success 204): empty body.
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import {
+  createClient,
+  type SupabaseClient,
+} from "https://esm.sh/@supabase/supabase-js@2.45.0";
 
 function empty(status: number): Response {
   return new Response(null, { status });
@@ -48,13 +54,15 @@ function base64urlJSON(obj: unknown): string {
   return base64url(new TextEncoder().encode(JSON.stringify(obj)));
 }
 
-function pemToDer(pem: string): Uint8Array {
+function pemToDer(pem: string): Uint8Array<ArrayBuffer> {
   const body = pem
     .replace(/-----BEGIN PRIVATE KEY-----/, "")
     .replace(/-----END PRIVATE KEY-----/, "")
     .replace(/\s+/g, "");
   const bin = atob(body);
-  const out = new Uint8Array(bin.length);
+  // Backed by a plain ArrayBuffer so WebCrypto's BufferSource type is
+  // satisfied under Deno 2's stricter typed-array generics.
+  const out = new Uint8Array(new ArrayBuffer(bin.length));
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
@@ -129,6 +137,38 @@ async function revokeAppleToken(authorizationCode: string): Promise<void> {
   });
 }
 
+const PHOTO_BUCKET = "meal-photos";
+
+/// Remove every object under `<user_id>/` in the private photo bucket.
+/// Best-effort and paged: a failure here is logged, never fatal, because
+/// the account deletion itself must not hang on an empty folder listing.
+async function purgeStorage(
+  admin: SupabaseClient,
+  userId: string,
+): Promise<void> {
+  const bucket = admin.storage.from(PHOTO_BUCKET);
+  const pageSize = 100;
+  for (let offset = 0; ; offset += pageSize) {
+    const { data, error } = await bucket.list(userId, { limit: pageSize, offset });
+    if (error) {
+      console.error(`delete-account: storage list failed — ${error.message}`);
+      return;
+    }
+    const paths = (data ?? [])
+      .filter((o) => typeof o.name === "string" && o.name.length > 0)
+      .map((o) => `${userId}/${o.name}`);
+    if (paths.length === 0) return;
+    const { error: rmErr } = await bucket.remove(paths);
+    if (rmErr) {
+      console.error(`delete-account: storage remove failed — ${rmErr.message}`);
+      return;
+    }
+    if (paths.length < pageSize) return;
+    // Removed objects fall out of the listing, so re-list from the start.
+    offset = -pageSize;
+  }
+}
+
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -173,6 +213,13 @@ serve(async (req) => {
 
   const admin = createClient(supabaseUrl, serviceKey);
 
+  // Storage first. The meal-photos bucket is owner-scoped by the first
+  // path segment (<user_id>/...), and storage.objects has no FK to
+  // auth.users, so without this step a deleted account's photos would
+  // outlive it. Photo logging is not in this version, so the folder is
+  // usually empty — the purge is still the only thing that guarantees it.
+  await purgeStorage(admin, userId);
+
   // Explicit deletes for clarity + error surface. Order is dependency-
   // safe: meal_items and meal_corrections reference meals; delete those
   // (or let cascade handle it) before meals themselves.
@@ -181,13 +228,22 @@ serve(async (req) => {
     "meal_corrections",
     "app_feedback",
     "insights",
+    "pattern_history",
+    "reflections",
+    "insight_runs",
     "daily_checkins",
     "health_days",
     "meals",
   ];
   for (const table of tables) {
     // .neq('id', '00000000-...') is unnecessary — RLS + user_id filter is enough.
-    await admin.from(table).delete().eq("user_id", userId);
+    const { error } = await admin.from(table).delete().eq("user_id", userId);
+    if (error) {
+      // Surface, don't abort: the auth delete below cascades everything
+      // with an FK, and a stuck row is better logged than left behind
+      // with the account still alive.
+      console.error(`delete-account: ${table} delete failed — ${error.message}`);
+    }
   }
 
   // Finally, remove the auth user. This invalidates their sessions and

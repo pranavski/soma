@@ -3,6 +3,10 @@ import SwiftUI
 /// "Not quite right?" — the per-meal correction sheet, opened from the
 /// meal-detail long-press affordance on a RecipeCard.
 ///
+/// It opens on any row that isn't mid-parse: Claude's guess, a failed
+/// parse (blank fields), a meal filed with consent off (the person's
+/// words as the dish, no range yet), and a meal already corrected once.
+///
 /// Behavioral rules:
 ///   * Calorie range is edited as low + high, both required, high >= low.
 ///     We enforce the spec's "always a range" contract here rather than
@@ -26,6 +30,7 @@ struct CorrectionSheet: View {
     @State private var newItemQuantity: String = ""
     @State private var isSubmitting = false
     @State private var errorText: String?
+    @State private var didLoadItems = false
 
     private let repository: CorrectionsRepository
 
@@ -83,12 +88,31 @@ struct CorrectionSheet: View {
                         Text(errorText)
                             .font(Font.Soma.margin)
                             .foregroundStyle(Color.persimmon)
+                    } else if !canSubmit {
+                        // The sheet also opens on meals that failed to parse,
+                        // where the dish and both numbers are blank. Say why
+                        // "save" is greyed out instead of leaving the user
+                        // poking at a dead button.
+                        Text("needs a dish name and both ends of the range.")
+                            .font(Font.Soma.margin)
+                            .foregroundStyle(Color.inkSoft)
                     }
 
                     actionRow
                 }
                 .padding(Theme.Spacing.xl)
             }
+            // The calorie fields use a number pad, which has no return key —
+            // without this there's no way to put the keyboard away.
+            .scrollDismissesKeyboard(.interactively)
+        }
+        // Start from the components parse-meal already found, so "save" keeps
+        // them instead of quietly filing a correction that says the meal had
+        // nothing in it.
+        .task {
+            guard !didLoadItems else { return }
+            didLoadItems = true
+            items = await repository.fetchItems(mealId: meal.id)
         }
     }
 
@@ -261,10 +285,14 @@ struct CorrectionSheet: View {
             calories_high: Int(caloriesHighText) ?? 0,
             items: items
         )
-        let original = MealCorrectionOriginal(
-            dish_name: meal.dishName,
-            cuisine: meal.cuisine
-        )
+        // Only a dish Claude named is an "original guess" worth learning
+        // an alias from. A manual row's name is the person's own — a
+        // correction of it, or a meal filed with consent off — and teaching
+        // the community table "their words → their words" would just be
+        // noise in every future parse prompt.
+        let original: MealCorrectionOriginal? = meal.dishWasParsed
+            ? MealCorrectionOriginal(dish_name: meal.dishName, cuisine: meal.cuisine)
+            : nil
 
         do {
             try await repository.submit(

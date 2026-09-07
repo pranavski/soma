@@ -31,9 +31,6 @@ extension Color {
     // The asset is still named "sage" in the catalog; we keep the file name
     // to avoid breaking other references but expose `bay` as the semantic name.
     static let bay           = Color("sage")
-    /// Deprecated alias — prefer `Color.bay`. Kept so existing call sites
-    /// don't break in this changeset; remove after the migration sweep.
-    static let sage          = Color("sage")
 
     // Facts / logged numerics
     static let graphite      = Color("graphite")

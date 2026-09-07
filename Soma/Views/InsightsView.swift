@@ -1,8 +1,13 @@
 import SwiftUI
 
 /// Insights — the home page. The app is an insight engine first, so the
-/// feed of hedged findings opens the app: ranked lab pages, a 30-day body
-/// trend beneath them, and a quick-log field pinned within thumb's reach.
+/// feed of hedged findings opens the app: ranked lab pages with a 30-day
+/// body trend beneath them.
+///
+/// Read-only on purpose. Logging lives on Today, behind "tell me" — one
+/// place to write a meal down means one path to get it right, and this
+/// page stays what it says it is: what Soma noticed, not another box to
+/// type into.
 ///
 /// Tone rules carried from the copy contract: findings are hedged, the
 /// persimmon caption carries the hedge, empty states explain honestly,
@@ -28,8 +33,20 @@ struct InsightsView: View {
 
                     if vm.insights.isEmpty {
                         if !vm.isLoading && !vm.isGenerating {
-                            EmptyFeedPage(note: vm.emptyStateNote)
+                            // One block or the other, never both: they would
+                            // otherwise say "nothing yet" twice in a row.
+                            // The reflections block carries the same note in
+                            // its footer when it wins.
+                            if vm.showsReflections {
+                                ReflectionsBlock(
+                                    reflections: vm.reflections,
+                                    note: vm.emptyStateNote
+                                )
                                 .padding(.horizontal, Theme.Spacing.xl)
+                            } else {
+                                EmptyFeedPage(note: vm.emptyStateNote)
+                                    .padding(.horizontal, Theme.Spacing.xl)
+                            }
                         }
                     } else {
                         VStack(alignment: .leading, spacing: Theme.Spacing.l) {
@@ -57,8 +74,17 @@ struct InsightsView: View {
                         .frame(height: 6)
                         .padding(.horizontal, Theme.Spacing.xl)
 
-                    // Room for the pinned quick-log field + tab bar.
-                    Spacer(minLength: 170)
+                    // On the screen where the claims live, not only in the
+                    // kitchen footer: once cards cite journals, the reader
+                    // has to be told here what they are not.
+                    Text("not medical advice. soma surfaces patterns, not diagnoses. talk to a clinician for anything that matters.")
+                        .font(Font.Soma.margin)
+                        .foregroundStyle(Color.inkSoft.opacity(0.85))
+                        .lineSpacing(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, Theme.Spacing.xl)
+
+                    Spacer(minLength: Theme.TabBar.scrollBottomInset)
                 }
             }
             .task { await vm.load() }
@@ -74,28 +100,6 @@ struct InsightsView: View {
                 }
                 #endif
             }
-            }
-
-            VStack {
-                Spacer()
-                QuickLogField()
-                    .padding(.horizontal, Theme.Spacing.xl)
-                    // Paper fade behind the pinned field so scrolled card
-                    // text doesn't read through the gap above the tab bar.
-                    .background {
-                        LinearGradient(
-                            colors: [
-                                Color.paper.opacity(0),
-                                Color.paper.opacity(0.92),
-                                Color.paper
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                        .padding(.horizontal, -Theme.Spacing.xl)
-                        .padding(.top, -Theme.Spacing.l)
-                        .allowsHitTesting(false)
-                    }
             }
         }
     }
@@ -114,7 +118,7 @@ private struct HeaderBlock: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-            Text(weekdayHand(date))
+            Text(SomaFormat.longDay(date))
                 .font(Font.Soma.dateLabel)
                 .foregroundStyle(Color.inkSoft)
 
@@ -128,12 +132,6 @@ private struct HeaderBlock: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func weekdayHand(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "EEEE, MMMM d"
-        return f.string(from: d).lowercased()
     }
 }
 
@@ -157,6 +155,72 @@ private struct ThinkingRow: View {
 // evidence the quiet second line, the persimmon caption carries the
 // hedge, and a suggested action (when present) sits as a dotted-off
 // footer aside — an option, never an instruction.
+
+// MARK: - Published context
+//
+// The one block on this card that is not Soma talking. Everything else is
+// an observation about this person's own 30 days, hedged because it has to
+// be; this is established physiology with a citation under it.
+//
+// So it is styled as a clipping pasted into the notebook rather than more
+// of the page: recessed paper (`paperSunk`), a mono eyebrow, and the
+// citation set small underneath. The visual break is doing real work — a
+// reader should never have to wonder which sentence is about them and
+// which is about people in general.
+//
+// Never rendered without a citation (see `Insight.publishedContext`), and
+// never rendered for a finding that ran counter to the literature — the
+// server omits the whole block in that case rather than explaining the
+// opposite of what someone experienced.
+private struct PublishedContextBlock: View {
+    let mechanism: String
+    let citation: String
+    let grade: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+            HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.s) {
+                Text("WHY THIS MIGHT HAPPEN")
+                    .font(Font.Soma.sectionTag)
+                    .tracking(2)
+                    .foregroundStyle(Color.inkSoft)
+                Spacer()
+                if let grade {
+                    // Strength of the underlying literature, not of this
+                    // person's pattern — ConfidenceBadge already carries
+                    // that, and conflating the two would be the whole
+                    // mistake this feature is trying to avoid.
+                    Text("EVIDENCE \(grade)")
+                        .font(Font.Soma.sectionTag)
+                        .tracking(1.5)
+                        .foregroundStyle(Color.inkSoft)
+                }
+            }
+
+            Text(mechanism)
+                .font(Font.Soma.dishNote)
+                .foregroundStyle(Color.ink)
+                .lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(citation)
+                .font(Font.Soma.margin)
+                .foregroundStyle(Color.inkSoft)
+                .lineSpacing(1)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(Theme.Spacing.m)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.indexCard, style: .continuous)
+                .fill(Color.paperSunk)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Radius.indexCard, style: .continuous)
+                        .strokeBorder(Color.rule.opacity(0.5), lineWidth: 0.8)
+                )
+        )
+    }
+}
 
 private struct InsightFeedCard: View {
     let insight: Insight
@@ -187,6 +251,14 @@ private struct InsightFeedCard: View {
             Text(insight.hedgeCaption)
                 .font(Font.Soma.margin)
                 .foregroundStyle(Color.persimmon)
+
+            if let context = insight.publishedContext {
+                PublishedContextBlock(
+                    mechanism: context.mechanism,
+                    citation: context.citation,
+                    grade: insight.evidenceGrade
+                )
+            }
 
             if let action = insight.suggestedAction {
                 InkRule(style: .dotted, color: Color.rule, weight: 0.8)
@@ -258,6 +330,112 @@ private struct ConfidenceBadge: View {
         case .high:   return Color.ink
         case .medium: return Color.graphite
         case .low:    return Color.inkSoft
+        }
+    }
+}
+
+// MARK: - Reflections (the early days)
+//
+// What the app can say before the statistics can say anything. These are
+// descriptions of the log — when the last plate lands, what keeps coming
+// back, the spread of a signal — and they relate nothing to anything, which
+// is what makes them honest on day three when a correlation would not be.
+//
+// So they must not look like findings. An InsightFeedCard is a raised lab
+// page with a shadow, ruled paper, a confidence badge and a persimmon hedge;
+// this is the opposite move — recessed into the page (`paperSunk`, the same
+// surface PublishedContextBlock uses for "this is not Soma concluding
+// something"), flat, no shadow, no badge, no persimmon. A reader should be
+// able to tell at a glance that nothing here is a claim, before reading a
+// word of it.
+//
+// One block rather than one card each, for the same reason: three separate
+// cards would read as three findings.
+
+private struct ReflectionsBlock: View {
+    let reflections: [Reflection]
+    /// Why there are no findings under this yet. Carried here rather than
+    /// left to EmptyFeedPage because only one of the two blocks is ever on
+    /// screen — two cards both opening with "nothing yet" reads as the app
+    /// apologising twice.
+    let note: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.l) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("FROM THE PAGE SO FAR")
+                    .font(Font.Soma.sectionTag)
+                    .tracking(2)
+                    .foregroundStyle(Color.inkSoft)
+                Spacer()
+                if let days = reflections.first?.windowDays {
+                    Text("LAST \(days) DAYS")
+                        .font(Font.Soma.sectionTag)
+                        .tracking(2)
+                        .foregroundStyle(Color.inkSoft)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: Theme.Spacing.l) {
+                ForEach(reflections) { reflection in
+                    ReflectionRow(reflection: reflection)
+                }
+            }
+
+            InkRule(style: .dotted, color: Color.rule, weight: 0.8)
+                .frame(height: 4)
+
+            // The disclosure that keeps this block from being read as a
+            // weaker insight feed. inkSoft rather than persimmon on purpose:
+            // persimmon marks the hedge on a claim, and there is no claim
+            // here to hedge.
+            VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+                Text("not findings — just what's written down.")
+                    .font(Font.Soma.margin)
+                    .foregroundStyle(Color.inkSoft)
+
+                Text(note)
+                    .font(Font.Soma.margin)
+                    .foregroundStyle(Color.inkSoft)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(Theme.Spacing.l + 2)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.indexCard, style: .continuous)
+                .fill(Color.paperSunk)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Radius.indexCard, style: .continuous)
+                        .strokeBorder(Color.rule.opacity(0.5), lineWidth: 0.8)
+                )
+        )
+    }
+}
+
+private struct ReflectionRow: View {
+    let reflection: Reflection
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.s + 2) {
+            Text("·")
+                .font(Font.Soma.sectionTag)
+                .foregroundStyle(Color.inkSoft)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(reflection.body)
+                    .font(Font.Soma.dishNote)
+                    .foregroundStyle(Color.ink)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(reflection.detail)
+                    .font(Font.Soma.margin)
+                    .foregroundStyle(Color.inkSoft)
+                    .lineSpacing(1)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }

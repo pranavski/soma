@@ -1,8 +1,16 @@
 # Soma — App Store Compliance Map (v1.0 submission)
 
-_Last audited: 2026-07-19, against the App Store Review Guidelines as
+_Last audited: 2026-08-02, against the App Store Review Guidelines as
 updated 2025-11-13 (the "third-party AI" revision of 5.1.2(i)) and the
 2025 expanded age-rating system._
+
+> **2026-08-02 remediation pass.** The five code-side blockers from the
+> 2026-07-19 audit are now closed: the app icon exists, the privacy policy
+> is in the app, third-party AI has a named pre-first-use consent gate that
+> also gates the code path, photo logging is flagged off, and the speech
+> purpose string matches the code. What remains is App Store Connect and
+> hosting work, marked **ASC** / **LEGAL** below — no code change can close
+> those. See §6 for the current state.
 
 This is a living checklist. Statuses:
 
@@ -12,15 +20,15 @@ This is a living checklist. Statuses:
 - `[ ]` **LEGAL** — needs a hosted legal artifact (privacy policy page, etc.)
 
 Repo facts this audit is based on: `Soma.xcodeproj` exists;
-`Soma/Soma.entitlements` has SIWA + HealthKit; `Soma/PrivacyInfo.xcprivacy`
+`Soma/Soma.entitlements` has SIWA + HealthKit (incl. background delivery); `Soma/PrivacyInfo.xcprivacy`
 exists; purpose strings live in build settings (`GENERATE_INFOPLIST_FILE =
 YES`, `INFOPLIST_KEY_*`); account deletion is implemented
 (`Soma/Features/Settings/DeleteAccountSheet.swift` +
 `supabase/functions/delete-account` with SIWA token revocation); CSV export
 exists (`MealExport.swift`); `docs/privacy-policy.md` exists but is not
-hosted; **photo logging is live in code** (`TodayView` camera/library chips →
-`parse-meal` photo branch → Roboflow + Claude) despite the spec calling it
-"deferred to v1.1".
+hosted; photo logging is not in the code — the camera/library chips, the
+`parse-meal` photo branch and its Roboflow detection step were removed, so
+the app matches the spec's "deferred to v1.1".
 
 ---
 
@@ -35,21 +43,16 @@ to revoke consent.
 
 - [x] Policy text written — `docs/privacy-policy.md` covers meals, HealthKit
   aggregates-only sync, Supabase, Anthropic, deletion, export
-- [ ] **LEGAL** — Host the policy at a stable public URL (any static page)
-- [ ] **ASC** — Set the Privacy Policy URL in App Store Connect
-- [ ] **CODE** — Add a privacy-policy link inside the app. There is currently
-  **no** link anywhere in Settings/About (`AboutSheet.swift` has none). A
-  `Link` row in `SettingsView`/`AboutSheet` is sufficient
-- [ ] **LEGAL** — Fix policy accuracy gaps before hosting:
-  - It says Anthropic receives "meal text only". Not true twice over:
-    (a) `generate-insights` sends HealthKit-derived correlation stats
-    (RHR/HRV deltas, day counts) to Claude for copy generation;
-    (b) the photo branch sends meal photos to **Roboflow** and (via the
-    photo path) image content into the parse pipeline. The policy never
-    mentions photos or Roboflow at all
-  - Decide: either gate photo logging OFF for v1.0 (as the deployment
-    checklist assumes) or update the policy + nutrition label + AI
-    disclosure to cover photos and Roboflow
+- [ ] **LEGAL** — Host the policy at a stable public URL. Plan: GitHub
+  Pages from `docs/privacy-policy.md`. Then set `SomaFeatures.privacyPolicyURL`
+  and flip `SomaFeatures.privacyPolicyIsHosted` so the in-app "read on the
+  web" link appears (it is hidden until then, so no reviewer taps a dead page)
+- [ ] **ASC** — Set the Privacy Policy URL and Support URL in App Store
+  Connect. Support email is `SomaFeatures.supportEmail` (the policy's contact)
+- [x] **CODE** — Privacy policy reachable in-app: full text in
+  `PrivacyPolicySheet`, linked from the sign-in screen and the kitchen (§6)
+- [x] **LEGAL** — Policy accuracy: the policy now states that the nightly
+  digest (meals, check-ins, daily health totals) goes to Claude (§6)
 
 ### 5.1.1 — Consent, purpose strings, data minimization
 
@@ -60,7 +63,7 @@ to revoke consent.
   degrades gracefully on denial (`SpeechCapture` error copy: "You can still
   type") — matches the "provide alternatives" requirement
 - [x] Data minimization by design: raw HealthKit samples never leave the
-  device; only 4 daily aggregate numbers sync (`HealthKitAggregator`)
+  device; only the 7 daily aggregate numbers sync (`HealthKitAggregator`)
 
 ### 5.1.1(v) — Account sign-in & deletion
 
@@ -103,8 +106,10 @@ disclosure is the weakest possible position.
 Soma sends user data to third-party AI from Edge Functions:
 1. **Anthropic (Claude)** — meal text / voice transcripts (`parse-meal`),
    and rule-computed health stats for insight copy (`generate-insights`)
-2. **Roboflow** — meal photos, base64, via hosted detection API
-   (`parse-meal` photo branch) — *only if photo logging ships in v1.0*
+**Consent is versioned against this list.** `AIDisclosure` stores its
+answer under `soma.ai.parseConsent.v1`. Consent describes a flow, so adding
+a recipient means bumping the key and asking again rather than relying on
+an answer given about something narrower.
 
 Status:
 
@@ -125,8 +130,6 @@ Status:
   are already computed rule-side); otherwise the disclosure and privacy
   policy must say health-derived aggregates reach Anthropic, which
   interacts badly with 5.1.3 (below)
-- [ ] **CODE or product decision** — Roboflow: either gate the photo path
-  off for v1.0, or add it to the disclosure, policy, and nutrition label
 
 ### 5.1.2(vi) + 5.1.3(i) — HealthKit data restrictions
 
@@ -136,16 +139,21 @@ improve health management (with permission) or for health research.
 
 - [x] No ads, no analytics SDKs, no data brokers, no tracking anywhere in
   the app — satisfied by design
-- [x] Raw HealthKit reads stay on-device; server only ever sees 4 daily
-  aggregate numbers per day (`health_days` table)
+- [x] Raw HealthKit reads stay on-device; server only ever sees the 7
+  daily aggregate numbers per day (`health_days` table). Background
+  delivery does not widen this: a background wakeup runs the same
+  on-device rollup as a foreground one (`HealthKitSync`)
 - [ ] **CODE (same item as above)** — the `generate-insights` → Claude call
   transmits HealthKit-*derived* statistics to a third party. It is arguably
   within the "improving health management" exception and carries no user
   identifier, but it contradicts the privacy policy's "meal text only"
   claim and is exactly the pattern the Nov-2025 AI revision targets.
   Recommendation: template copy, no Claude call for insights
-- [x] The app discloses which health data types it reads (purpose string
-  lists steps, sleep, resting HR, HRV; `HealthKitSheet` in Settings)
+- [x] The app discloses which health data types it reads — all seven:
+  steps, sleep, resting HR, HRV, weight, active energy, workouts. The
+  purpose string, `HealthKitSheet` and the privacy policy list the same
+  set as `HealthKitAggregator.sampleTypes` requests (fixed 2026-09-07; the
+  string and sheet used to name only four)
 
 ### 5.1.3(ii) — No false HealthKit writes; no health data in iCloud
 
@@ -180,6 +188,53 @@ medical decisions."
   Describe it as a food journal that shows patterns
 - [x] Calorie estimates are presented as explicit ranges with no accuracy
   claim — do not add "accurate calorie counting" language anywhere
+
+#### 1.4.1 — the published-evidence layer (added 2026-08-05)
+
+Insight cards can now carry a "why this might happen" block: one sentence of
+general physiology plus a citation, drawn from a static table in
+`supabase/functions/generate-insights/evidence.ts`. This is the highest-risk
+surface the app has under 1.4.1, and it is deliberately constrained:
+
+- [x] **Never standalone.** A mechanism only ever appears attached to a
+  pattern found in this user's own logged data. The app has no screen that
+  shows nutrition facts on their own, and must never gain one — that would
+  turn a journal into a health-advice publication
+- [x] **Never generated.** Claude selects which finding to describe and
+  writes the personal sentence; the mechanism and citation are joined
+  server-side from the reviewed table by `evidenceColumns()` in
+  `generate-insights/index.ts`. The model has no field in its response
+  schema through which it could author a scientific claim or a citation, so
+  a hallucinated reference is structurally impossible
+- [x] **Never prescriptive.** `evidence_test.ts` fails the build on any
+  mechanism containing second-person address (`you`, `your`) or an
+  imperative (`should`, `avoid`, `limit`, `aim for`, `try to`, `cut back`,
+  `recommend`, `advise`), and separately on `causes` or `will`. The science
+  describes physiology in general; it never tells the reader to do anything
+- [x] **Never a therapeutic claim.** Every source is about ordinary
+  physiology in healthy adults (sleep duration, resting heart rate, HRV).
+  Nothing in the table concerns a disease, a treatment, or a diagnosis, and
+  nothing may be added that does
+- [x] **Always sourced.** `insights_evidence_all_or_nothing` (DB) and
+  `Insight.publishedContext` (client) both refuse to render a mechanism
+  without its citation. An unsourced health claim cannot reach the screen
+- [x] **Withheld when the user's data disagrees.** If someone's own pattern
+  runs opposite to the literature, the finding still surfaces but no
+  mechanism is attached — the app does not explain physiology that did not
+  happen to them
+- [ ] **ASC** — The "not medical advice" line above becomes more important,
+  not less, now that cards cite journals. Ensure it is visible on the
+  Insights screen itself, not only in About
+- [ ] **ASC** — App Store description must not mention "science-backed",
+  "clinically proven", "evidence-based nutrition", or name any journal.
+  The citations are context for a personal observation, and marketing copy
+  that inverts that framing is what would attract a 1.4.1 rejection
+
+**Reviewer-facing summary, if asked:** Soma does not give nutrition advice.
+It finds statistical associations in a user's own food and body logs, and
+where an association matches established physiology it shows what is known,
+with a reference. It sets no goals, recommends no foods, and makes no
+therapeutic claims.
 
 ### 2.5.1 — APIs used for intended purposes
 
@@ -231,33 +286,23 @@ The expanded questionnaire (mandatory for all submissions since
 - [x] Audio is never stored or uploaded — only the transcript is sent to
   `parse-meal`. So the nutrition label needs "Other User Content" (the
   transcript), **not** "Audio Data"
-- [ ] **CODE** — **Mismatch:** the purpose string claims "on-device speech
-  recognition", but `SpeechCapture.swift` never sets
-  `request.requiresOnDeviceRecognition = true`, so iOS may route audio
-  through Apple's servers. Pick one:
-  - (a) set `requiresOnDeviceRecognition = true` when
-    `recognizer.supportsOnDeviceRecognition` (keeps the string honest;
-    slightly lower accuracy), or
-  - (b) soften the string (drop "on-device") — see §4 draft.
-  A purpose string that overstates privacy is a rejection/metadata risk
+- [x] **CODE** — Purpose string and code agree: `SpeechCapture` sets
+  `requiresOnDeviceRecognition` wherever the device supports it, and the
+  string says "on device wherever your iPhone supports it" (§6). The
+  recogniser follows the device locale, falling back to en-US
 
-### Camera / photos (only if photo logging ships in v1.0)
+### Camera / photos
 
-- [x] `NSCameraUsageDescription` present; photo library uses `PhotosPicker`
-  (out-of-process — no permission or `NSPhotoLibraryUsageDescription`
-  needed, and it matches 5.1.1's "use out-of-process pickers" preference)
-- [ ] **Decision required** — Deployment checklist says photo logging is
-  deferred to v1.1 and screenshots must not show it, but
-  `TodayView`/`TodayViewModel.submitPhoto`/`parse-meal` photo branch are
-  live. If it ships: add "Photos or Videos" to the nutrition label +
-  manifest, cover photos/Roboflow in the policy and AI disclosure. If
-  deferred: feature-flag the chips off. Shipping a hidden-but-reachable
-  feature that Review discovers but screenshots deny is its own risk
+- [x] Photo logging is not in v1.0: no camera or library entry point, no
+  `NSCameraUsageDescription`, no photo branch in `parse-meal`. If it ships
+  in v1.1: add "Photos or Videos" to the nutrition label + manifest, name
+  the detection vendor in the policy and AI disclosure, bump the consent
+  key, and add the purpose string back
 
 ### Other submission blockers (from repo state)
 
-- [ ] **CODE** — App icon: `Assets.xcassets` appiconset is empty; Xcode
-  will refuse to archive for distribution without the 1024pt icon
+- [x] **CODE** — App icon present (`DesignAssets/build-assets.sh` drops
+  the flattened 1024pt icon into the appiconset)
 - [x] iPhone-only, portrait-only, iOS 17+ — set in project
 - [ ] **ASC** — Screenshots (iPhone only), subtitle, keywords, support URL
   (required alongside the privacy policy URL)
@@ -275,7 +320,6 @@ Functionality** in every case.
 |---|---|---|---|---|---|
 | Health & Fitness → **Health** | Yes | Yes | No | App Functionality | Daily aggregates only: steps, sleep minutes, resting HR, HRV (`health_days`). Raw samples never leave device |
 | User Content → **Other User Content** | Yes | Yes | No | App Functionality | Meal text/voice transcripts, parsed items, corrections, notes, energy check-ins, feedback |
-| User Content → **Photos or Videos** | Only if photo logging ships | Yes | No | App Functionality | Meal photos in private Supabase bucket |
 | Identifiers → **User ID** | Yes | Yes | No | App Functionality | Supabase user UUID / app-scoped Apple ID |
 | Contact Info → **Email Address** | Yes | Yes | No | App Functionality | From Sign in with Apple, only if user shares it (Hide My Email respected). Declare it: it is stored with the auth record |
 | Diagnostics → **Other Diagnostic Data** | Only if actually retained | Yes | No | App Functionality | Currently declared in the manifest; if nothing beyond transient request logs is stored, this can be dropped from both manifest and label |
@@ -283,7 +327,7 @@ Functionality** in every case.
 | Usage Data, Location, Browsing, Purchases, Contacts, Search History, Sensitive Info | **No** | — | — | — | Not collected |
 
 Notes:
-- The Claude/Roboflow calls do not add label categories by themselves
+- The Claude calls do not add label categories by themselves
   (ephemeral server-side processing), but the *stored results* (parsed
   meals, insights) are already covered under Other User Content /
   Health.
@@ -327,11 +371,11 @@ user's language; never overstate.
 
 | Key | Current | Verdict |
 |---|---|---|
-| `NSHealthShareUsageDescription` | "Soma reads steps, sleep, resting heart rate, and HRV so it can look for gentle correlations with how you're eating and feeling. Reads only — nothing is written back." | Keep. Names the exact types, states the purpose, states read-only |
+| `NSHealthShareUsageDescription` | "Soma reads steps, sleep, resting heart rate, HRV, weight, active energy and workouts so it can look for gentle correlations with how you're eating and feeling. Reads only — nothing is written back." | Keep. Names all seven types the aggregator requests, states the purpose, states read-only |
 | `NSHealthUpdateUsageDescription` | "Soma does not write to HealthKit." | Keep (key must exist for some SDK paths; honest) |
 | `NSMicrophoneUsageDescription` | "Soma listens only while you tap the speak button, to turn what you say into a meal entry." | Keep |
-| `NSSpeechRecognitionUsageDescription` | "Soma uses on-device speech recognition to turn spoken meals into text." | **Fix.** Code does not force on-device recognition. Either set `requiresOnDeviceRecognition` in `SpeechCapture` or replace with: "Soma turns what you say into meal text. Recognition may use Apple's speech service; Soma never stores or uploads the audio." |
-| `NSCameraUsageDescription` | "Soma uses the camera only when you snap a meal photo, to turn it into a meal entry." | Keep if photos ship; harmless if the feature is flagged off |
+| `NSSpeechRecognitionUsageDescription` | "Soma turns what you say into meal text, on device wherever your iPhone supports it. Soma never stores or uploads the audio." | Keep. `SpeechCapture` forces on-device recognition where supported, so the qualifier is true |
+| `NSCameraUsageDescription` | — (removed with photo logging) | Add back only if photos ship |
 
 ---
 
@@ -339,14 +383,13 @@ user's language; never overstate.
 
 1. **Third-party AI without in-app consent — 5.1.2(i), Nov 2025 text.**
    Meal text goes to Anthropic with no in-app disclosure or permission
-   flow; Roboflow isn't disclosed anywhere. This is the exact pattern the
+   flow. This is the exact pattern the
    revision targets and the most probable rejection. Fix: named, explicit,
    pre-first-parse consent sheet + policy accuracy.
 2. **Privacy policy inaccuracies.** "Anthropic gets meal text only" is
-   contradicted by `generate-insights` (health-derived stats) and the
-   photo branch (Roboflow). Reviewers diff app behavior against the
-   policy; inaccurate policies fail 5.1.1(i). Fix policy or fix behavior
-   (template insight copy; gate photos).
+   contradicted by `generate-insights` (health-derived stats). Reviewers
+   diff app behavior against the policy; inaccurate policies fail
+   5.1.1(i). Fix policy or fix behavior (template insight copy).
 3. **No in-app privacy policy link.** Hard requirement of 5.1.1(i);
    currently absent from Settings/About. One `Link` row fixes it.
 4. **Health-derived data reaching a third-party AI — 5.1.3(i) optics.**
@@ -380,3 +423,56 @@ questionnaire "medical or wellness" answer; never add CloudKit sync for
 - [Account deletion requirement — Apple Developer News](https://developer.apple.com/news/?id=12m75xbj)
 - [Updated age ratings in App Store Connect — Apple Developer News](https://developer.apple.com/news/?id=ks775ehf)
 - [Age Rating Updates — Upcoming Requirements — Apple Developer](https://developer.apple.com/news/upcoming-requirements/?id=07242025a)
+
+---
+
+## 6. Remediation status — 2026-08-02
+
+### Closed in code
+
+| Was | Now |
+|---|---|
+| No in-app privacy policy (5.1.1(i) hard fail) | `Soma/Features/Privacy/PrivacyPolicySheet.swift` carries the **full policy text** in-app, reachable from the sign-in screen *and* kitchen → Privacy, plus a `Link` to the hosted URL |
+| No third-party AI disclosure or consent (5.1.2(i) — top rejection risk) | `AIDisclosure` + `AIDisclosureSheet`: named ("Claude, an AI model made by Anthropic"), itemised sent/never list, shown once before the first parse, `interactiveDismissDisabled`. **The consent also gates the code** — `TodayViewModel.submit` and `QuickLogViewModel.logMeal` return before invoking `parse-meal` unless `hasConsented`. Declining leaves logging fully usable |
+| Consent not revocable | kitchen → Reading meals (`AIConsentSettingsSheet`) toggles it either way; sign-out resets it |
+| Policy claimed "Anthropic gets meal text only" — false, `generate-insights` sends health-derived day rows | Policy, in-app policy, and disclosure now all describe **both** uses, including the nightly digest of daily health totals |
+| Photo logging live but Roboflow disclosed nowhere | Removed outright: camera/library chips, `MealLogger.logPhoto`, the `parse-meal` photo branch and Roboflow detection, and `NSCameraUsageDescription`. Nothing reaches a vendor other than Anthropic |
+| Speech purpose string claimed on-device; code never set it | `SpeechCapture` sets `requiresOnDeviceRecognition` where supported, and the purpose string was softened to stay true where it isn't |
+| App icon missing — cannot archive | `DesignAssets/master/app-icon-1024.png` + `build-assets.sh`, which crops the master's transparent margin and flattens it; a flattened RGB 1024 PNG is wired into the appiconset and verified present in the built bundle |
+| HealthKit "connected" flag survived sign-out, so a second account on the same phone auto-synced health data | `HealthKitSync.clearConnected()` + `stopObserving()` on sign-out |
+| No in-app way to stop HealthKit syncing — 5.1.1(v) expects the user to be able to withdraw what they granted | "disconnect" in `HealthKitSheet` stops observers and background delivery; copy states that already-synced summaries remain until account deletion |
+
+### Still open — not closeable in code
+
+- [ ] **LEGAL** — Host `docs/privacy-policy.md` (GitHub Pages), point
+  `SomaFeatures.privacyPolicyURL` at it and set `privacyPolicyIsHosted`
+  to true. Until then the in-app web link is hidden and the sheet carries
+  the full text
+- [ ] **ASC** — Privacy Policy URL + Support URL in App Store Connect;
+  support contact is `SomaFeatures.supportEmail`
+- [ ] **ASC** — Set the four `APPLE_*` secrets in Supabase or SIWA token
+  revocation silently no-ops during deletion (see deployment checklist §2)
+- [ ] **ASC** — Nutrition label per §2. "Photos or Videos" is **not**
+  declared; there is no photo path in the app
+- [ ] **ASC** — Age-rating questionnaire; Review Notes stating Soma is a
+  journal with no diagnosis/treatment/dosing
+- [ ] **ASC** — Screenshots. They must not show photo logging (it's off) and
+  must avoid outcome claims ("lose weight", "improve your metabolism")
+- [ ] **CODE (verify at archive)** — Generate the Xcode privacy report and
+  reconcile with §3. `OtherDiagnosticData` is correctly declared: feedback
+  rows store app version and iOS version (`FeedbackRepository`)
+
+### Recommended, not done — needs a product decision
+
+The nightly `generate-insights` digest sends HealthKit-derived daily values
+to Anthropic. This is now honestly disclosed and consented, which satisfies
+5.1.2(i), but 5.1.3(i) optics are still better if health data never reaches
+a third-party AI at all. Two options, both out of scope for a bug-fix pass:
+
+1. Keep Claude for meal parsing only; generate insight copy from templates
+   over rule-computed stats. Strongest position, loses the LLM's ability to
+   find un-predeclared correlations — i.e. the point of the current engine.
+2. Keep the engine, but have `generate-insights` read a per-user opt-in
+   column and skip health rows for users who decline. Needs a migration plus
+   an Edge Function change; the nightly cron runs server-side, so a
+   client-only flag cannot enforce it.

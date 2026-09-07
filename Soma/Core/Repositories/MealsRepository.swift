@@ -38,30 +38,70 @@ struct MealsRepository {
     /// Insert a new meal in `pending` state. The Edge Function fills in
     /// dish_name/calories on success; the row exists in the meantime so the
     /// Today screen can render a "parsing…" card without waiting.
-    ///
-    /// `id` can be supplied by the caller — the photo path convention
-    /// (`<user_id>/<meal_id>.jpg`) needs the meal id before the row exists,
-    /// so the photo flow generates the UUID client-side, uploads, then
-    /// inserts.
     @discardableResult
     func insertPendingMeal(
         source: Meal.Source,
         voiceTranscript: String?,
-        photoPath: String? = nil,
-        id: UUID? = nil,
         eatenAt: Date = Date()
+    ) async throws -> UUID {
+        try await insertMeal(
+            source: source,
+            voiceTranscript: voiceTranscript,
+            eatenAt: eatenAt,
+            dishName: nil,
+            parseStatus: .pending
+        )
+    }
+
+    /// Insert a meal that will never be parsed — the person has said no to
+    /// Claude reading their meals. It goes on the record as `manual` with
+    /// the transcript as its dish name, so the card shows their own words
+    /// instead of a spinner that never stops, and "not quite right?" is
+    /// open from the first moment to fill in the rest by hand.
+    ///
+    /// No calorie range: soma doesn't guess one without the parse, and the
+    /// card's contract is a range or nothing, never a bare number.
+    @discardableResult
+    func insertWrittenMeal(
+        transcript: String,
+        source: Meal.Source,
+        eatenAt: Date = Date()
+    ) async throws -> UUID {
+        // Same ceiling the correction path enforces on a dish name — a long
+        // spoken meal is still a fine transcript, it just isn't a title.
+        let title = String(transcript.prefix(Self.dishNameLimit))
+        return try await insertMeal(
+            source: source,
+            voiceTranscript: transcript,
+            eatenAt: eatenAt,
+            dishName: title,
+            parseStatus: .manual
+        )
+    }
+
+    /// submit-correction caps dish names at 120 characters; keep the
+    /// consent-off title under the same limit so a later correction of the
+    /// row never bounces on length.
+    private static let dishNameLimit = 120
+
+    private func insertMeal(
+        source: Meal.Source,
+        voiceTranscript: String?,
+        eatenAt: Date,
+        dishName: String?,
+        parseStatus: Meal.ParseStatus
     ) async throws -> UUID {
         let userId = try await client.auth.session.user.id
 
-        let row = PendingMealInsert(
-            id: id,
+        let row = MealInsert(
             userId: userId,
             eatenAt: Self.iso(eatenAt),
             eatenDate: Self.localDateString(eatenAt),
             eatenHour: Self.localHour(eatenAt),
             source: source.rawValue,
             voiceTranscript: voiceTranscript,
-            photoPath: photoPath
+            dishName: dishName,
+            parseStatus: parseStatus.rawValue
         )
 
         let response = try await client
@@ -76,82 +116,90 @@ struct MealsRepository {
         return decoded.id
     }
 
-    private struct PendingMealInsert: Encodable {
-        let id: UUID?
+    private struct MealInsert: Encodable {
         let userId: UUID
         let eatenAt: String
         let eatenDate: String
         let eatenHour: Int
         let source: String
         let voiceTranscript: String?
-        let photoPath: String?
+        let dishName: String?
+        let parseStatus: String
 
         enum CodingKeys: String, CodingKey {
-            case id
             case userId          = "user_id"
             case eatenAt         = "eaten_at"
             case eatenDate       = "eaten_date"
             case eatenHour       = "eaten_hour"
             case source
             case voiceTranscript = "voice_transcript"
-            case photoPath       = "photo_path"
+            case dishName        = "dish_name"
+            case parseStatus     = "parse_status"
         }
     }
 
-    /// Upload a prepared JPEG to the private `meal-photos` bucket under the
-    /// RLS-enforced path `<user_id>/<meal_id>.jpg` and return that path.
-    /// The bucket's insert policy only admits paths whose first segment is
-    /// the caller's own auth.uid(), so a bad path fails server-side too.
-    func uploadMealPhoto(_ data: Data, mealId: UUID) async throws -> String {
-        let userId = try await client.auth.session.user.id
-        let path = "\(userId.uuidString.lowercased())/\(mealId.uuidString.lowercased()).jpg"
-        try await client.storage
-            .from("meal-photos")
-            .upload(path, data: data, options: FileOptions(contentType: "image/jpeg"))
-        return path
-    }
+    /// Rows whose dish name and ranges are trustworthy enough to repeat:
+    /// what Claude parsed, and what the person corrected by hand. A
+    /// corrected meal is the *best* template there is — the one dish the
+    /// user took the trouble to name properly — so it must never be a
+    /// second-class row here.
+    private static let repeatableStatuses = [
+        Meal.ParseStatus.parsed.rawValue,
+        Meal.ParseStatus.manual.rawValue,
+    ]
 
-    /// One-tap repeat. Copies the most recent parsed row that carries the
-    /// given `dish_name`, inserting a new `source='repeat'` row with the
-    /// same dish and macro ranges. Returns the new meal id.
+    /// One-tap repeat. Copies the most recent parsed-or-corrected row that
+    /// carries the given `dish_name`, inserting a new `source='repeat'` row
+    /// with the same dish, macro, caffeine and alcohol ranges. Returns the
+    /// new meal id.
     ///
     /// Repeats do NOT hit parse-meal — we already have the parse from the
     /// original. The `insight-rules` skill wants repeat rows in place so the
     /// `repeat_dish_energy` rule can find them.
+    ///
+    /// Caffeine and alcohol are copied on purpose: a repeated coffee with no
+    /// caffeine range would read as *unparsed for stimulants* to the engine's
+    /// `anyParsed` guard, quietly dropping that day from the caffeine tests.
     @discardableResult
     func repeatMeal(dishName: String, eatenAt: Date = Date()) async throws -> UUID {
         let userId = try await client.auth.session.user.id
 
-        // Pull the most recent parsed row of this dish. RLS scopes it to the
-        // caller so we don't need to filter by user_id here. `.limit(1)` +
-        // array-decode avoids `.maybeSingle()` — PostgrestTransformBuilder
-        // doesn't expose it after `.limit(...)`.
+        // Pull the most recent trustworthy row of this dish. RLS scopes it
+        // to the caller so we don't need to filter by user_id here.
+        // `.limit(1)` + array-decode avoids `.maybeSingle()` —
+        // PostgrestTransformBuilder doesn't expose it after `.limit(...)`.
         let template = try await client
             .from("meals")
-            .select("dish_name,calories_low,calories_high,protein_g_low,protein_g_high,carbs_g_low,carbs_g_high,fat_g_low,fat_g_high,fiber_g_low,fiber_g_high")
+            .select("dish_name,cuisine,calories_low,calories_high,protein_g_low,protein_g_high,carbs_g_low,carbs_g_high,fat_g_low,fat_g_high,fiber_g_low,fiber_g_high,caffeine_mg_low,caffeine_mg_high,alcohol_g_low,alcohol_g_high")
             .eq("dish_name", value: dishName)
-            .eq("parse_status", value: "parsed")
+            .in("parse_status", values: Self.repeatableStatuses)
             .order("eaten_at", ascending: false)
             .limit(1)
             .execute()
 
         struct Template: Decodable {
             let dish_name: String?
+            let cuisine: String?
             let calories_low: Int?; let calories_high: Int?
             let protein_g_low: Int?; let protein_g_high: Int?
             let carbs_g_low: Int?; let carbs_g_high: Int?
             let fat_g_low: Int?; let fat_g_high: Int?
             let fiber_g_low: Int?; let fiber_g_high: Int?
+            let caffeine_mg_low: Int?; let caffeine_mg_high: Int?
+            let alcohol_g_low: Int?; let alcohol_g_high: Int?
         }
 
         let candidates = (try? JSONDecoder().decode([Template].self, from: template.data)) ?? []
         let t: Template = candidates.first ?? Template(
             dish_name: dishName,
+            cuisine: nil,
             calories_low: nil, calories_high: nil,
             protein_g_low: nil, protein_g_high: nil,
             carbs_g_low: nil, carbs_g_high: nil,
             fat_g_low: nil, fat_g_high: nil,
-            fiber_g_low: nil, fiber_g_high: nil
+            fiber_g_low: nil, fiber_g_high: nil,
+            caffeine_mg_low: nil, caffeine_mg_high: nil,
+            alcohol_g_low: nil, alcohol_g_high: nil
         )
 
         struct RepeatInsert: Encodable {
@@ -161,6 +209,7 @@ struct MealsRepository {
             let eaten_hour: Int
             let source: String
             let dish_name: String?
+            let cuisine: String?
             let parse_status: String
             let parsed_at: String
             let calories_low: Int?; let calories_high: Int?
@@ -168,6 +217,8 @@ struct MealsRepository {
             let carbs_g_low: Int?; let carbs_g_high: Int?
             let fat_g_low: Int?; let fat_g_high: Int?
             let fiber_g_low: Int?; let fiber_g_high: Int?
+            let caffeine_mg_low: Int?; let caffeine_mg_high: Int?
+            let alcohol_g_low: Int?; let alcohol_g_high: Int?
         }
 
         let now = Self.iso(Date())
@@ -178,13 +229,16 @@ struct MealsRepository {
             eaten_hour: Self.localHour(eatenAt),
             source: "repeat",
             dish_name: t.dish_name ?? dishName,
+            cuisine: t.cuisine,
             parse_status: "parsed",
             parsed_at: now,
             calories_low: t.calories_low, calories_high: t.calories_high,
             protein_g_low: t.protein_g_low, protein_g_high: t.protein_g_high,
             carbs_g_low: t.carbs_g_low, carbs_g_high: t.carbs_g_high,
             fat_g_low: t.fat_g_low, fat_g_high: t.fat_g_high,
-            fiber_g_low: t.fiber_g_low, fiber_g_high: t.fiber_g_high
+            fiber_g_low: t.fiber_g_low, fiber_g_high: t.fiber_g_high,
+            caffeine_mg_low: t.caffeine_mg_low, caffeine_mg_high: t.caffeine_mg_high,
+            alcohol_g_low: t.alcohol_g_low, alcohol_g_high: t.alcohol_g_high
         )
 
         let response = try await client
@@ -198,14 +252,34 @@ struct MealsRepository {
         return try JSONDecoder().decode(InsertedId.self, from: response.data).id
     }
 
+    /// Take a meal off the record — a mis-tap, a double-log, or something
+    /// the person simply doesn't want counted. RLS ("owner can delete" on
+    /// public.meals) scopes this to the caller, so no user_id filter here.
+    ///
+    /// What goes with it: `meal_items` cascade, and any correction the user
+    /// filed keeps its own copy of the text (meal_corrections.meal_id is ON
+    /// DELETE SET NULL), so removing a meal never destroys the record of a
+    /// correction they took the trouble to write.
+    func deleteMeal(_ meal: Meal) async throws {
+        try await client
+            .from("meals")
+            .delete()
+            .eq("id", value: meal.id)
+            .execute()
+    }
+
     /// Distinct recent dish names ordered by most-recent-eaten. Used to
-    /// power the repeat-a-meal chips.
+    /// power the repeat-a-meal chips. Corrected rows count — see
+    /// `repeatableStatuses`.
     func fetchRecentDishNames(limit: Int = 6) async throws -> [String] {
         let response = try await client
             .from("meals")
             .select("dish_name,eaten_at")
             .not("dish_name", operator: .is, value: "null")
-            .eq("parse_status", value: "parsed")
+            // A meal filed with consent off has a name but no range yet —
+            // nothing to repeat until the person fills it in.
+            .not("calories_low", operator: .is, value: "null")
+            .in("parse_status", values: Self.repeatableStatuses)
             .order("eaten_at", ascending: false)
             .limit(limit * 4) // over-fetch to dedupe client-side
             .execute()

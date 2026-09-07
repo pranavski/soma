@@ -339,11 +339,10 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.food-and-drink";
-				INFOPLIST_KEY_NSCameraUsageDescription = "Soma uses the camera only when you snap a meal photo, to turn it into a meal entry.";
-				INFOPLIST_KEY_NSHealthShareUsageDescription = "Soma reads steps, sleep, resting heart rate, and HRV so it can look for gentle correlations with how you're eating and feeling. Reads only — nothing is written back.";
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "Soma reads steps, sleep, resting heart rate, HRV, weight, active energy and workouts so it can look for gentle correlations with how you're eating and feeling. Reads only — nothing is written back.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Soma does not write to HealthKit.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Soma listens only while you tap the speak button, to turn what you say into a meal entry.";
-				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Soma uses on-device speech recognition to turn spoken meals into text.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Soma turns what you say into meal text, on device wherever your iPhone supports it. Soma never stores or uploads the audio.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -377,11 +376,10 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.food-and-drink";
-				INFOPLIST_KEY_NSCameraUsageDescription = "Soma uses the camera only when you snap a meal photo, to turn it into a meal entry.";
-				INFOPLIST_KEY_NSHealthShareUsageDescription = "Soma reads steps, sleep, resting heart rate, and HRV so it can look for gentle correlations with how you're eating and feeling. Reads only — nothing is written back.";
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "Soma reads steps, sleep, resting heart rate, HRV, weight, active energy and workouts so it can look for gentle correlations with how you're eating and feeling. Reads only — nothing is written back.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Soma does not write to HealthKit.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Soma listens only while you tap the speak button, to turn what you say into a meal entry.";
-				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Soma uses on-device speech recognition to turn spoken meals into text.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Soma turns what you say into meal text, on device wherever your iPhone supports it. Soma never stores or uploads the audio.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

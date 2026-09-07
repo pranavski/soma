@@ -94,6 +94,62 @@ final class MealDecoderTests: XCTestCase {
         XCTAssertTrue(meal.macros.isEmpty)
     }
 
+    // MARK: - Caffeine and alcohol on the card
+
+    func testStimulantNoteIsNilWhenBothAreZeroOrUnparsed() {
+        XCTAssertNil(makeMeal().stimulantNote)
+        var meal = makeMeal()
+        meal.caffeineMgLow = 0; meal.caffeineMgHigh = 0
+        meal.alcoholGLow = 0; meal.alcoholGHigh = 0
+        XCTAssertNil(meal.stimulantNote)
+    }
+
+    func testStimulantNoteRendersRangesForWhicheverIsPresent() {
+        var coffee = makeMeal(dishName: "flat white")
+        coffee.caffeineMgLow = 80; coffee.caffeineMgHigh = 120
+        coffee.alcoholGLow = 0; coffee.alcoholGHigh = 0
+        XCTAssertEqual(coffee.stimulantNote, "~80–120 mg caffeine")
+
+        var both = makeMeal(dishName: "espresso martini")
+        both.caffeineMgLow = 60; both.caffeineMgHigh = 80
+        both.alcoholGLow = 14; both.alcoholGHigh = 20
+        XCTAssertEqual(both.stimulantNote, "~60–80 mg caffeine · ~14–20 g alcohol")
+    }
+
+    func testDecodesCaffeineAndAlcoholColumns() throws {
+        let json = """
+        {
+          "id": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+          "user_id": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+          "eaten_at": "2026-07-01T12:30:00Z",
+          "logged_at": "2026-07-01T12:31:00Z",
+          "source": "voice",
+          "dish_name": "cold brew",
+          "calories_low": 5, "calories_high": 15,
+          "protein_g_low": 0, "protein_g_high": 1,
+          "carbs_g_low": 0, "carbs_g_high": 2,
+          "fat_g_low": 0, "fat_g_high": 0,
+          "fiber_g_low": 0, "fiber_g_high": 0,
+          "caffeine_mg_low": 150, "caffeine_mg_high": 210,
+          "alcohol_g_low": 0, "alcohol_g_high": 0,
+          "notes": null, "photo_path": null, "voice_transcript": "cold brew",
+          "parse_status": "parsed"
+        }
+        """.data(using: .utf8)!
+        let meal = try SupabaseDates.makeDecoder().decode(Meal.self, from: json)
+        XCTAssertEqual(meal.caffeineMgHigh, 210)
+        XCTAssertEqual(meal.stimulantNote, "~150–210 mg caffeine")
+    }
+
+    // MARK: - Which rows have an AI guess to learn from
+
+    func testOnlyParsedOrFailedRowsCountAsParsedByClaude() {
+        XCTAssertTrue(makeMeal(parseStatus: .parsed).dishWasParsed)
+        XCTAssertTrue(makeMeal(parseStatus: .failed).dishWasParsed)
+        XCTAssertFalse(makeMeal(parseStatus: .manual).dishWasParsed)
+        XCTAssertFalse(makeMeal(parseStatus: .pending).dishWasParsed)
+    }
+
     func testRepeatSourceRoundtrips() throws {
         // `repeat` collides with a Swift keyword; the enum uses the raw
         // string "repeat" via `case repeated = "repeat"`. Regression guard.

@@ -1,41 +1,39 @@
 # Soma — TODO
 
-Prove the meal-log loop end-to-end before anything else. Voice transcript →
-row insert → real Claude parse → Today shows the result. Skip photos, skip
-HealthKit, skip insights until this slice works.
+Live list. Everything the audit of 2026-09-07 called partially built or
+broken has been fixed in code; what remains is hosting, App Store Connect
+and deploy steps that need a human with credentials.
 
-## Move 1 — Wire `parse-meal` to Claude (voice-only) ✅
-- [x] Anthropic Messages call in `supabase/functions/parse-meal/index.ts`
-      against the strict JSON contract.
-- [x] Server-side shape validator (`isParsedMeal`); mismatch → 422 fallback.
-- [x] Voice branch only; photo branch short-circuits to 422 fallback.
-- [ ] Set `ANTHROPIC_API_KEY` via `supabase secrets set` (do NOT commit).
-- [ ] Deploy: `supabase functions deploy parse-meal`.
-- [ ] Smoke-test with a real user JWT + stub `meals` row.
+## Before the next TestFlight build
+- [ ] `supabase db push` — two migrations (insights read-only for clients,
+      `insight_runs`), then `supabase migration list` to confirm.
+- [ ] `supabase functions deploy generate-insights submit-correction delete-account`
+      (`parse-meal` is deployed separately with menu awareness).
+- [ ] Confirm the four `APPLE_*` secrets are set, or SIWA token revocation
+      silently no-ops during account deletion.
+- [ ] Host `docs/privacy-policy.md` (GitHub Pages), set
+      `SomaFeatures.privacyPolicyURL`, flip `privacyPolicyIsHosted`.
+- [ ] App Store Connect: privacy URL, support URL, nutrition label, age
+      rating, review notes, screenshots — docs/app-store-compliance.md §6.
 
-## Move 2 — Capture sheet + `MealsRepository.insert` ✅
-- [x] `MealsRepository.insertPendingMeal(source:, voiceTranscript:, eatenAt:)`.
-- [x] `CaptureSheet` replaces the two-Text stub: Speak (SFSpeechRecognizer)
-      + Type it (TextField), Send button.
-- [x] `TodayViewModel.submit(transcript:)` inserts pending row + invokes
-      `parse-meal` + reloads.
-- [x] `Meal.displayName` state-aware ("parsing…" / "couldn't read that").
-- [x] Info.plist mic + speech usage strings.
+## Nice to have, not blocking
+- [ ] `scripts/build-fdc-reference.ts` has never been run to completion;
+      `_shared/fdc-reference.json` is empty and the composition block in
+      the parse prompt is dormant until it is.
+- [ ] Macro / caffeine / alcohol ranges are not editable from the
+      correction sheet; after a correction the meal keeps Claude's values
+      for those six.
+- [ ] Feedback rows (`app_feedback`) have no inbox beyond the SQL console.
+- [ ] Meal plans — design note only (docs/meal-plans-design.md), no code.
 
-## Move 3 — Cheap unblockers ✅
-- [x] `IPHONEOS_DEPLOYMENT_TARGET` 26.0 → 17.0 (both Debug + Release).
-- [x] Sign-out row in `SettingsView` wired to `SessionStore.signOut()`.
-
-## Explicitly deferred
-- HealthKit (entitlement, NSHealthShareUsageDescription, HKHealthStore,
-  daily aggregation, `health_days` upsert). No value until ~7 days of meals
-  exist to correlate against.
-- `generate-insights` v1 rules. Need real meals + `health_days` to tune
-  thresholds against; synthetic data will mislead.
-- History / Insights / Settings data wiring. Cosmetic until meals exist.
-- AppIcon, missing `docs/food-body-record-mockup.jsx`, XCTest target.
-
-## One-week target
-Open the sim, tap +, say "two eggs on sourdough with avocado," wait ~2s,
-see "Eggs on sourdough · ~380–520" on Today with three `meal_items`
-underneath.
+## Done (kept for the record)
+- Voice / typed meal → pending row → Claude parse → Today card.
+- Declined AI consent files the meal as written, correction open.
+- Corrections rewrite meal_items; corrected rows repeatable and re-correctable.
+- HealthKit read-only rollup, background delivery, disconnect, purpose
+  string names all seven types.
+- Nightly + on-demand insight engine with FDR, evidence layer, reflections,
+  per-user throttle on pull-to-refresh.
+- Fonts bundled (Caveat, Fraunces, IBM Plex Mono).
+- Wax-paper "compare yesterday" on Today.
+- CI (Deno tests + iOS build/tests), README.

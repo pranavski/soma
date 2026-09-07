@@ -1,23 +1,34 @@
 import SwiftUI
 
-/// Requests HealthKit read authorization and pulls a first 28-day rollup.
-/// After the initial pull the app's supposed to top up nightly — but the
-/// simple "user opens Settings and taps HealthKit" flow is enough for v1;
-/// background delivery is a follow-up.
+/// Requests HealthKit read authorization, pulls the first rollup, and from
+/// then on reports where the sync stands.
+///
+/// HealthKit won't tell us whether reads were actually granted, so the sheet
+/// reflects our own connection flag rather than pretending to know: once the
+/// user has connected, it opens showing that, plus when we last managed to
+/// sync — not the "not yet connected" line it used to greet everyone with.
 struct HealthKitSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private let aggregator = HealthKitAggregator.shared
-    private let repo = HealthDaysRepository()
 
     @State private var state: LoadState = .idle
 
     enum LoadState: Equatable {
         case idle
         case requesting
-        case syncing(count: Int?)
-        case done(days: Int)
+        case syncing
+        /// `days` is known only right after a sync we just ran.
+        case connected(lastSync: Date?, days: Int?)
+        case disconnected
         case failed(String)
+
+        var isConnected: Bool {
+            if case .connected = self { return true }
+            return false
+        }
+
+        var isBusy: Bool { self == .requesting || self == .syncing }
     }
 
     var body: some View {
@@ -37,7 +48,7 @@ struct HealthKitSheet: View {
                     .font(Font.Soma.dayLine)
                     .foregroundStyle(Color.ink)
 
-                Text("Soma reads steps, sleep, resting heart rate, and HRV to look for gentle correlations. Raw HealthKit samples stay on your phone — only a daily summary is stored.")
+                Text("Soma reads steps, sleep, resting heart rate, HRV, weight, active energy and workouts to look for gentle correlations. Raw HealthKit samples stay on your phone — only a daily summary is stored.")
                     .font(Font.Soma.dishNote)
                     .foregroundStyle(Color.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)
@@ -51,45 +62,76 @@ struct HealthKitSheet: View {
             .padding(Theme.Spacing.xl)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .onAppear(perform: restoreState)
+    }
+
+    /// The connection flag outlives the sheet, so read it back every time
+    /// rather than starting from `.idle`.
+    private func restoreState() {
+        guard !state.isBusy else { return }
+        if HealthKitSync.isConnected {
+            state = .connected(lastSync: HealthKitSync.lastSyncedAt, days: nil)
+        } else if state != .disconnected {
+            state = .idle
+        }
     }
 
     @ViewBuilder
     private var statusRow: some View {
         switch state {
         case .idle:
-            Text(aggregator.isAvailable
-                 ? "not yet connected — tap “connect” to allow."
-                 : "HealthKit isn't available on this device.")
-                .font(Font.Soma.margin)
-                .foregroundStyle(Color.inkSoft)
+            statusText(aggregator.isAvailable
+                       ? "not yet connected — tap “connect” to allow."
+                       : "HealthKit isn't available on this device.",
+                       color: Color.inkSoft)
         case .requesting:
-            HStack(spacing: Theme.Spacing.s) {
-                ProgressView().controlSize(.small).tint(Color.inkSoft)
-                Text("waiting on permission…")
-                    .font(Font.Soma.margin)
-                    .foregroundStyle(Color.inkSoft)
-            }
+            busyText("waiting on permission…")
         case .syncing:
-            HStack(spacing: Theme.Spacing.s) {
-                ProgressView().controlSize(.small).tint(Color.inkSoft)
-                Text("pulling the last 28 days…")
-                    .font(Font.Soma.margin)
-                    .foregroundStyle(Color.inkSoft)
+            busyText("pulling the last \(HealthKitAggregator.windowDays) days…")
+        case .connected(let lastSync, let days):
+            VStack(alignment: .leading, spacing: 2) {
+                statusText(connectedLine(days: days), color: Color.bay)
+                if let lastSync {
+                    statusText("last synced \(SomaFormat.relative(lastSync)) · keeps up on its own.",
+                               color: Color.inkSoft)
+                } else {
+                    statusText("keeps up on its own from here.", color: Color.inkSoft)
+                }
             }
-        case .done(let days):
-            Text("connected — \(days) days of signal ready.")
-                .font(Font.Soma.margin)
-                .foregroundStyle(Color.persimmon)
+        case .disconnected:
+            VStack(alignment: .leading, spacing: 2) {
+                statusText("disconnected — nothing more will sync.", color: Color.inkSoft)
+                statusText("days already stored stay until you delete your account.",
+                           color: Color.inkSoft)
+            }
         case .failed(let msg):
-            Text(msg)
-                .font(Font.Soma.margin)
-                .foregroundStyle(Color.persimmon)
-                .fixedSize(horizontal: false, vertical: true)
+            statusText(msg, color: Color.persimmon)
+        }
+    }
+
+    private func connectedLine(days: Int?) -> String {
+        guard let days else { return "connected." }
+        return days == 0
+            ? "connected — no signal in HealthKit yet."
+            : "connected — \(days) days of signal ready."
+    }
+
+    private func statusText(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(Font.Soma.margin)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func busyText(_ text: String) -> some View {
+        HStack(spacing: Theme.Spacing.s) {
+            ProgressView().controlSize(.small).tint(Color.inkSoft)
+            statusText(text, color: Color.inkSoft)
         }
     }
 
     private var actionRow: some View {
-        HStack {
+        HStack(spacing: Theme.Spacing.l) {
             Button("close") { dismiss() }
                 .font(Font.Soma.buttonLg)
                 .foregroundStyle(Color.inkSoft)
@@ -97,10 +139,18 @@ struct HealthKitSheet: View {
 
             Spacer()
 
+            if state.isConnected {
+                Button("disconnect") { disconnect() }
+                    .font(Font.Soma.buttonLg)
+                    .foregroundStyle(Color.inkSoft)
+                    .buttonStyle(.plain)
+                    .disabled(state.isBusy)
+            }
+
             Button {
                 Task { await connect() }
             } label: {
-                Text("connect")
+                Text(state.isConnected ? "sync now" : "connect")
                     .font(Font.Soma.buttonLg)
                     .foregroundStyle(Color.paper)
                     .padding(.horizontal, Theme.Spacing.xl)
@@ -108,10 +158,12 @@ struct HealthKitSheet: View {
                     .background(Capsule(style: .continuous).fill(Color.ink))
             }
             .buttonStyle(.plain)
-            .disabled(!aggregator.isAvailable || state == .requesting)
+            .disabled(!aggregator.isAvailable || state.isBusy)
         }
     }
 
+    /// Connect and re-sync are the same trip — asking again once we're
+    /// already authorized is a no-op that HealthKit answers immediately.
     private func connect() async {
         state = .requesting
         do {
@@ -120,13 +172,24 @@ struct HealthKitSheet: View {
                 state = .failed("HealthKit permission couldn't be requested on this device.")
                 return
             }
-            state = .syncing(count: nil)
-            let rows = try await aggregator.aggregate(days: 28)
-            try await repo.upsert(rows)
-            HealthKitForegroundSync.markConnected()
-            state = .done(days: rows.count)
+            state = .syncing
+            let rows = try await HealthKitSync.shared.syncNow()
+            HealthKitSync.markConnected()
+            // Only now can background delivery start — before this, the
+            // connected flag was false and registration would no-op.
+            HealthKitSync.shared.startObservingIfConnected()
+            state = .connected(lastSync: HealthKitSync.lastSyncedAt, days: rows.count)
         } catch {
             state = .failed(error.localizedDescription)
         }
+    }
+
+    /// Stops the sync. Deliberately does *not* delete what's already stored
+    /// — silently erasing weeks of body data behind a button labelled
+    /// "disconnect" would be a nasty surprise. Delete account does that.
+    private func disconnect() {
+        HealthKitSync.shared.stopObserving()
+        HealthKitSync.clearConnected()
+        state = .disconnected
     }
 }

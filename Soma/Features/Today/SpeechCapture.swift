@@ -13,7 +13,14 @@ final class SpeechCapture: ObservableObject {
     @Published private(set) var isRecording: Bool = false
     @Published private(set) var errorText: String?
 
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    /// The person's own language first. `SFSpeechRecognizer(locale:)` is nil
+    /// for a locale Apple's recogniser doesn't support, so fall back to
+    /// English (US) rather than to no dictation at all — the rest of the
+    /// app already follows the device locale for dates and clocks, and a
+    /// hard-coded en-US gave non-English speakers poor transcripts with no
+    /// hint why.
+    private let recognizer = SFSpeechRecognizer(locale: .current)
+        ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private let audioEngine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
@@ -29,17 +36,15 @@ final class SpeechCapture: ObservableObject {
             isRecording = true
         } catch {
             errorText = error.localizedDescription
-            cleanup()
+            teardown()
         }
     }
 
     func stop() {
         guard isRecording else { return }
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
         request?.endAudio()
         task?.finish()
-        cleanup()
+        teardown()
         isRecording = false
     }
 
@@ -49,9 +54,21 @@ final class SpeechCapture: ObservableObject {
         errorText = nil
     }
 
-    private func cleanup() {
+    /// Unconditionally tears the audio graph down. `stop()` is guarded on
+    /// `isRecording`, so a failure *during* `beginSession` — after the engine
+    /// is running but before we flip the flag — used to leave the tap
+    /// installed and the mic live, with the orange recording indicator stuck
+    /// on until the app was killed. Everything here is safe to call twice.
+    private func teardown() {
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.inputNode.removeTap(onBus: 0)
         request = nil
         task = nil
+        // Hand the audio session back so other apps' audio resumes.
+        try? AVAudioSession.sharedInstance()
+            .setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     private func requestAuth() async -> Bool {
@@ -71,12 +88,29 @@ final class SpeechCapture: ObservableObject {
     }
 
     private func beginSession() throws {
+        // Check the recognizer *before* touching the audio hardware — the
+        // old order started the engine first and then bailed, which is how
+        // the mic got stranded.
+        guard let recognizer, recognizer.isAvailable else {
+            throw NSError(
+                domain: "SpeechCapture", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Speech recognition is unavailable."]
+            )
+        }
+
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.record, mode: .measurement, options: .duckOthers)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
+        // NSSpeechRecognitionUsageDescription promises on-device recognition,
+        // so honour it wherever the device can. Without this iOS is free to
+        // ship the audio to Apple's servers and the purpose string becomes a
+        // false privacy claim (App Review reads these).
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
         self.request = request
 
         let input = audioEngine.inputNode
@@ -86,13 +120,6 @@ final class SpeechCapture: ObservableObject {
         }
         audioEngine.prepare()
         try audioEngine.start()
-
-        guard let recognizer, recognizer.isAvailable else {
-            throw NSError(
-                domain: "SpeechCapture", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Speech recognition is unavailable."]
-            )
-        }
 
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }

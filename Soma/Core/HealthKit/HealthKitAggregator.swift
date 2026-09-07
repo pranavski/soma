@@ -11,8 +11,11 @@ import HealthKit
 final class HealthKitAggregator {
     static let shared = HealthKitAggregator()
 
-    /// `nil` on iOS Simulator (HealthKit is unavailable there in most builds)
-    /// or on hardware where the store fails to initialize.
+    /// `nil` only where the device genuinely has no health database. The
+    /// iOS Simulator *does* report HealthKit as available (the store is
+    /// simply empty until you add samples in the Health app), so this flow
+    /// is exercisable there — an empty sync is a legitimate outcome, not a
+    /// broken one.
     private let store: HKHealthStore?
 
     private init() {
@@ -21,18 +24,29 @@ final class HealthKitAggregator {
 
     var isAvailable: Bool { store != nil }
 
+    /// Escape hatch for the sync coordinator, which needs the same store to
+    /// register observer queries and toggle background delivery.
+    var healthStore: HKHealthStore? { store }
+
     // MARK: - Types we read
     // Sleep is HKCategoryTypeIdentifier; the others are HKQuantityTypeIdentifier.
-    private var readTypes: Set<HKObjectType> {
-        var types: Set<HKObjectType> = []
-        if let steps = HKObjectType.quantityType(forIdentifier: .stepCount) { types.insert(steps) }
-        if let rhr   = HKObjectType.quantityType(forIdentifier: .restingHeartRate) { types.insert(rhr) }
-        if let hrv   = HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN) { types.insert(hrv) }
-        if let sleep = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.insert(sleep) }
-        if let mass  = HKObjectType.quantityType(forIdentifier: .bodyMass) { types.insert(mass) }
-        if let energy = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned) { types.insert(energy) }
-        types.insert(HKObjectType.workoutType())
+
+    /// The sample types themselves — observer queries need `HKSampleType`,
+    /// which is narrower than the `HKObjectType` authorization takes.
+    static var sampleTypes: [HKSampleType] {
+        var types: [HKSampleType] = []
+        if let steps = HKObjectType.quantityType(forIdentifier: .stepCount) { types.append(steps) }
+        if let rhr   = HKObjectType.quantityType(forIdentifier: .restingHeartRate) { types.append(rhr) }
+        if let hrv   = HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN) { types.append(hrv) }
+        if let sleep = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.append(sleep) }
+        if let mass  = HKObjectType.quantityType(forIdentifier: .bodyMass) { types.append(mass) }
+        if let energy = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned) { types.append(energy) }
+        types.append(HKObjectType.workoutType())
         return types
+    }
+
+    private var readTypes: Set<HKObjectType> {
+        Set(Self.sampleTypes.map { $0 as HKObjectType })
     }
 
     // MARK: - Authorization
@@ -52,10 +66,16 @@ final class HealthKitAggregator {
 
     // MARK: - Aggregation
 
+    /// The trailing window we sync. Matches `WINDOW_DAYS` in
+    /// `supabase/functions/generate-insights/index.ts` — syncing a shorter
+    /// window than the engine scores leaves the oldest days of every fresh
+    /// connection empty.
+    nonisolated static let windowDays = 30
+
     /// Compute per-day rollups for the last `days` local days ending today.
     /// Returns an entry for every day HealthKit has *any* signal for; days
     /// with zero data are skipped so we don't paper over gaps with fake zeros.
-    func aggregate(days: Int = 28, calendar: Calendar = .current) async throws -> [HealthDay] {
+    func aggregate(days: Int = windowDays, calendar: Calendar = .current) async throws -> [HealthDay] {
         guard let store else { return [] }
         let anchor = calendar.startOfDay(for: Date())
         guard let start = calendar.date(byAdding: .day, value: -(days - 1), to: anchor) else { return [] }
@@ -78,44 +98,18 @@ final class HealthKitAggregator {
                                             start: start, end: anchor, calendar: calendar)
         async let workouts = workoutMinutesByStartDay(store: store, start: start, end: anchor, calendar: calendar)
 
-        let stepMap    = try await steps
-        let rhrMap     = try await rhr
-        let hrvMap     = try await hrv
-        let sleepMap   = try await sleep
-        let weightMap  = try await weight
-        let energyMap  = try await energy
-        let workoutMap = try await workouts
-
-        var out: [HealthDay] = []
-        var day = start
-        while day <= anchor {
-            let key = calendar.startOfDay(for: day)
-            let s   = stepMap[key]
-            let sm  = sleepMap[key]
-            let r   = rhrMap[key]
-            let h   = hrvMap[key]
-            let w   = weightMap[key]
-            let e   = energyMap[key]
-            let wm  = workoutMap[key]
-            // Skip days with literally nothing — we don't want to overwrite
-            // a real earlier row with all-nil values and drop its tier.
-            if s != nil || sm != nil || r != nil || h != nil || w != nil || e != nil || wm != nil {
-                out.append(HealthDay(
-                    day: key,
-                    steps: s,
-                    sleepMinutes: sm,
-                    restingHrBpm: r,
-                    hrvMs: h,
-                    weightKg: w,
-                    activeEnergyKcal: e,
-                    workoutMinutes: wm,
-                    tier: HealthDay.tier(steps: s, sleep: sm, rhr: r, hrv: h)
-                ))
-            }
-            guard let next = calendar.date(byAdding: .day, value: 1, to: day) else { break }
-            day = next
-        }
-        return out
+        return HealthDayBucketing.rows(
+            from: start,
+            through: anchor,
+            calendar: calendar,
+            steps: try await steps,
+            sleepMinutes: try await sleep,
+            restingHr: try await rhr,
+            hrv: try await hrv,
+            weightKg: try await weight,
+            activeEnergy: try await energy,
+            workoutMinutes: try await workouts
+        )
     }
 
     // MARK: - Query helpers
@@ -192,19 +186,14 @@ final class HealthKitAggregator {
         )
         let samples = try await descriptor.result(for: store)
 
-        var minutesByStartDay: [Date: Int] = [:]
-        for s in samples {
-            // Only "asleep" values count — HKCategoryValueSleepAnalysis has
-            // multiple asleep sub-stages plus inBed / awake. We want any
-            // asleep* value; ignore the rest.
-            guard Self.isAsleep(sample: s) else { continue }
-            let day = calendar.startOfDay(for: s.startDate)
-            let minutes = Int(s.endDate.timeIntervalSince(s.startDate) / 60.0)
-            if minutes > 0 {
-                minutesByStartDay[day, default: 0] += minutes
-            }
-        }
-        return minutesByStartDay
+        // Only "asleep" values count — HKCategoryValueSleepAnalysis has
+        // multiple asleep sub-stages plus inBed / awake. We want any
+        // asleep* value; ignore the rest.
+        let sessions = samples
+            .filter(Self.isAsleep(sample:))
+            .map { HealthDayBucketing.Session(start: $0.startDate, end: $0.endDate) }
+
+        return HealthDayBucketing.minutesByStartDay(sessions, calendar: calendar)
     }
 
     /// Workouts are attributed to the local day they *started* — a session
@@ -225,15 +214,11 @@ final class HealthKitAggregator {
         )
         let workouts = try await descriptor.result(for: store)
 
-        var minutesByStartDay: [Date: Int] = [:]
-        for workout in workouts {
-            let day = calendar.startOfDay(for: workout.startDate)
-            let minutes = Int(workout.duration / 60.0)
-            if minutes > 0 {
-                minutesByStartDay[day, default: 0] += minutes
-            }
+        let sessions = workouts.map {
+            HealthDayBucketing.Session(start: $0.startDate, duration: $0.duration)
         }
-        return minutesByStartDay
+
+        return HealthDayBucketing.minutesByStartDay(sessions, calendar: calendar)
     }
 
     private static func isAsleep(sample: HKCategorySample) -> Bool {
@@ -248,40 +233,135 @@ final class HealthKitAggregator {
     }
 }
 
-/// Quiet re-sync on app foreground so `health_days` doesn't go stale the
-/// day after the user connects (the insight tiers starve without it).
-/// HealthKit deliberately hides read-authorization state, so "connected"
-/// is our own flag, set the first time the Settings sheet syncs.
+/// Keeps `health_days` fresh without the user thinking about it.
+///
+/// Two paths feed it:
+/// - **Background delivery.** `HKObserverQuery` + `enableBackgroundDelivery`
+///   wake the app when new samples land, so the nightly insight job doesn't
+///   score a window that stopped updating whenever the user last opened us.
+/// - **App foreground.** A belt-and-braces pass, in case background wakeups
+///   were throttled or the user denied nothing but never opens the app.
+///
+/// HealthKit deliberately hides read-authorization state, so "connected" is
+/// our own flag, set the first time the Settings sheet syncs.
 @MainActor
-final class HealthKitForegroundSync {
-    static let shared = HealthKitForegroundSync()
+final class HealthKitSync {
+    static let shared = HealthKitSync()
 
     private static let connectedKey = "soma.healthkit.connected"
     private static let lastSyncKey  = "soma.healthkit.lastSyncAt"
-    private static let minInterval: TimeInterval = 6 * 3600
+
+    /// Foreground passes are cheap but pointless in bursts. Background
+    /// wakeups get a shorter floor: they're the path that has to keep the
+    /// nightly job fed, and HealthKit already rate-limits them to hourly.
+    private static let foregroundMinInterval: TimeInterval = 6 * 3600
+    private static let backgroundMinInterval: TimeInterval = 3 * 3600
 
     private var isSyncing = false
+    private var observers: [HKObserverQuery] = []
+
+    // MARK: - Connection flag
+
+    static var isConnected: Bool {
+        UserDefaults.standard.bool(forKey: connectedKey)
+    }
+
+    /// When we last successfully upserted a rollup — `nil` if never.
+    static var lastSyncedAt: Date? {
+        UserDefaults.standard.object(forKey: lastSyncKey) as? Date
+    }
 
     static func markConnected() {
         UserDefaults.standard.set(true, forKey: connectedKey)
     }
 
-    func syncIfConnected(repository: HealthDaysRepository = HealthDaysRepository()) async {
+    /// Called on sign-out and account deletion. The flag lives in
+    /// UserDefaults, which is per-device rather than per-account, so without
+    /// this the next person to sign in on the phone would silently start
+    /// syncing HealthKit aggregates into *their* account on first
+    /// foreground — health data crossing accounts with nobody asked.
+    static func clearConnected() {
         let defaults = UserDefaults.standard
-        guard defaults.bool(forKey: Self.connectedKey), !isSyncing else { return }
-        if let last = defaults.object(forKey: Self.lastSyncKey) as? Date,
-           Date().timeIntervalSince(last) < Self.minInterval {
+        defaults.removeObject(forKey: connectedKey)
+        defaults.removeObject(forKey: lastSyncKey)
+    }
+
+    // MARK: - Background delivery
+
+    /// Register observer queries and ask HealthKit to wake us for new
+    /// samples. Safe to call repeatedly — a second call is a no-op while
+    /// observers are already running.
+    ///
+    /// Must run early in launch (see `AppDelegate`): HealthKit can start the
+    /// app in the background purely to deliver an update, and the handler
+    /// has to already be installed when it does.
+    func startObservingIfConnected() {
+        guard Self.isConnected, observers.isEmpty,
+              let store = HealthKitAggregator.shared.healthStore else { return }
+
+        for type in HealthKitAggregator.sampleTypes {
+            let query = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completion, _ in
+                // Called off the main actor, and HealthKit keeps retrying
+                // with backoff until `completion` runs — so it runs on every
+                // path, including the throttled no-op and the failure.
+                Task { @MainActor in
+                    await self?.sync(minInterval: Self.backgroundMinInterval)
+                    completion()
+                }
+            }
+            store.execute(query)
+            observers.append(query)
+
+            store.enableBackgroundDelivery(for: type, frequency: .hourly) { _, _ in
+                // Nothing to do on failure: the foreground pass still covers
+                // us, and there's no user-facing promise to walk back.
+            }
+        }
+    }
+
+    /// Tear down observers and background delivery. Called on disconnect and
+    /// on sign-out — leaving them running would keep waking the app to sync
+    /// data nobody asked us for any more.
+    func stopObserving() {
+        guard let store = HealthKitAggregator.shared.healthStore else { return }
+        for query in observers {
+            store.stop(query)
+        }
+        observers.removeAll()
+        store.disableAllBackgroundDelivery { _, _ in }
+    }
+
+    // MARK: - Syncing
+
+    func syncIfConnected(repository: HealthDaysRepository = HealthDaysRepository()) async {
+        await sync(minInterval: Self.foregroundMinInterval, repository: repository)
+    }
+
+    /// Force a pull regardless of the throttle — the Settings sheet's
+    /// "connect" and manual re-sync, where the user is watching and expects
+    /// something to happen.
+    @discardableResult
+    func syncNow(repository: HealthDaysRepository = HealthDaysRepository()) async throws -> [HealthDay] {
+        let rows = try await HealthKitAggregator.shared.aggregate()
+        if !rows.isEmpty {
+            try await repository.upsert(rows)
+            UserDefaults.standard.set(Date(), forKey: Self.lastSyncKey)
+        }
+        return rows
+    }
+
+    private func sync(
+        minInterval: TimeInterval,
+        repository: HealthDaysRepository = HealthDaysRepository()
+    ) async {
+        guard Self.isConnected, !isSyncing else { return }
+        if let last = Self.lastSyncedAt, Date().timeIntervalSince(last) < minInterval {
             return
         }
         isSyncing = true
         defer { isSyncing = false }
-        do {
-            let rows = try await HealthKitAggregator.shared.aggregate(days: 28)
-            guard !rows.isEmpty else { return }
-            try await repository.upsert(rows)
-            defaults.set(Date(), forKey: Self.lastSyncKey)
-        } catch {
-            // Silent by design — the next foreground pass retries.
-        }
+        // Silent by design — the next pass retries. A background wakeup with
+        // no restored auth session lands here too, which is fine.
+        _ = try? await syncNow(repository: repository)
     }
 }

@@ -133,10 +133,31 @@ inventory**, worth knowing about before you duplicate them elsewhere:
 — claim in `.pullQuote`, evidence in `.dishNote`, the hedge caption
 always in `Color.persimmon`) and `ConfidenceBadge` (ink-intensity scale,
 not traffic-light colors: low fades toward `inkSoft`, high is full
-`ink`). `Features/Insights/QuickLogField.swift` and `TrendChart.swift`
-are feature-level compositions built entirely from the tokens above —
-good reference for "how do I build a new feature that still looks like
-Soma," since they don't introduce anything not in this inventory.
+`ink`). `Features/Insights/TrendChart.swift` is a feature-level
+composition built entirely from the tokens above — good reference for
+"how do I build a new feature that still looks like Soma," since it
+doesn't introduce anything not in this inventory.
+
+`Features/Meals/MealCardActions.swift` is the press-and-hold menu on a
+meal card (correct it / take it off the record, delete always behind a
+confirmation) plus the `MealCardHint` margin note that makes the
+long-press findable. Both Today and History attach it via
+`.mealCardActions(for:onCorrect:onDelete:)` — extend that rather than
+adding a second gesture for editing meals.
+
+`Features/Meals/CaptureSheet.swift` is the ORDER UP ticket — speak /
+type / "a familiar one" chips, plus the bounded "when" control that lets
+an entry be filed onto an earlier time or day. Today presents it against
+now; History presents the same sheet against the day selected in the
+ledger (`PlateOnDayRow`, the dashed "plate one" invitation under the
+day's check-in row). Both hand the work to `MealLogger`, and the window a
+"when" may land in is `MealEntryWindow` — never the future, never past
+the insight engine's 30 days.
+
+Logging belongs to **Today and History** — capture now, or fill in a day
+you missed. It does **not** belong on Insights: that feed used to carry a
+pinned quick-log input (`QuickLogField`, removed), it's read-only now, and
+new "just type it here" entry points don't belong on it.
 
 ## Rules
 - **One job per color.** Before using a token, ask what job it's doing —

@@ -9,8 +9,10 @@ streaks-shaming, no calorie targets, never medical advice.
 
 ## Stack
 SwiftUI iOS 17+, MVVM, async/await. Supabase (Auth via Sign in with Apple,
-Postgres, private Storage, Edge Functions). Claude API (claude-sonnet-4-6)
-called ONLY from Edge Functions. HealthKit read-only.
+Postgres, private Storage, Edge Functions). Claude API called ONLY from
+Edge Functions — `claude-sonnet-4-6` for parse-meal, `claude-haiku-4-5`
+for generate-insights (it selects and writes copy; it does no arithmetic).
+HealthKit read-only.
 
 ## Source-of-truth docs — read before relevant work
 - docs/food-body-record-mvp-spec.md  (schema, screens, insight rules)
@@ -32,7 +34,14 @@ insight-rules (any insight engine work).
 - Xcode: no xcodebuild MCP server is configured — use `xcodebuild`
   directly. After EVERY Swift change: build, fix errors, then run on the
   iPhone 16 simulator and check logs before reporting done.
-- github MCP: one PR per phase, conventional commits
+- No GitHub MCP either — use `gh`. One PR per phase, conventional commits.
+- CI: `.github/workflows/ci.yml` runs the Deno tests and the iOS build +
+  unit tests on every push and PR.
+
+## Working conventions
+- Ship-time constants (privacy URL, support email) live in
+  `Soma/Core/SomaFeatures.swift`; `TODO.md` and `docs/deployment-checklist.md`
+  are the live status lists — keep them current when finishing work.
 
 ## Hard rules
 - Calories are ALWAYS ranges in UI copy ("~550–700"), never bare numbers

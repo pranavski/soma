@@ -1,66 +1,52 @@
 # Fonts — Soma type system
 
-The app references three custom typefaces. Until the `.ttf` files are
-dropped into this folder and registered with the bundle, `Theme.swift`
-falls back to sensible system substitutes — the design still works, but
-it's reading "borrowed" rather than "ours."
+Three typefaces, all under the SIL Open Font License (the OFL texts sit
+alongside the files and ship in the bundle, as the licence asks):
 
-## Files to drop here
-
-All three are free, from Google Fonts:
-
-- **Caveat** — `Caveat-Regular.ttf`, `Caveat-Bold.ttf`
-  https://fonts.google.com/specimen/Caveat
-  Used as: `Font.hand(...)`, `Font.Soma.timestamp`,
+- **Caveat** — `Caveat-Regular.ttf`, `Caveat-Bold.ttf` (static).
+  The handwritten voice: `Font.hand(...)`, `Font.Soma.timestamp`,
   `Font.Soma.margin`, `Font.Soma.dateLabel`, `Font.Soma.signature`,
   `Font.Soma.tabLabel`.
-  Fallback today: **Bradley Hand**.
-
-- **Fraunces** — `Fraunces-Regular.ttf`, `Fraunces-Italic.ttf`,
-  `Fraunces-SemiBold.ttf`
-  https://fonts.google.com/specimen/Fraunces
-  Used as: `Font.display(...)`, `Font.Soma.dayLine`,
+- **Fraunces** — `Fraunces-Regular.ttf`, `Fraunces-Italic.ttf`
+  (the variable roman and italic files, opsz/wght/SOFT/WONK axes).
+  `Theme.swift` asks for the named instances `Fraunces-Regular`,
+  `Fraunces-Italic` and `Fraunces-SemiBold`; CoreText exposes those from
+  the variable files, and the optical-size axis lets the same file serve
+  the wordmark and a dish name. `Font.display(...)`, `Font.Soma.dayLine`,
   `Font.Soma.dish`, `Font.Soma.pullQuote`, `Font.Soma.logo`,
   `Font.Soma.buttonLg`.
-  Fallback today: **system .serif italic**.
-
 - **IBM Plex Mono** — `IBMPlexMono-Regular.ttf`, `IBMPlexMono-Medium.ttf`
-  https://fonts.google.com/specimen/IBM+Plex+Mono
-  Used as: `Font.ticket(...)`, `Font.Soma.caloric`,
-  `Font.Soma.numeric`, `Font.Soma.stampTime`,
+  (static). The kitchen-ticket voice: `Font.ticket(...)`,
+  `Font.Soma.caloric`, `Font.Soma.numeric`, `Font.Soma.stampTime`,
   `Font.Soma.sectionTag`, `Font.Soma.buttonSm`.
-  Fallback today: **system .monospaced** (SF Mono).
 
-## Registering the fonts in the bundle
+## How they're registered
 
-Two steps after dropping the `.ttf` files into this folder:
+The project uses a file-system-synchronized group, so anything in this
+folder is a bundle resource automatically. The faces are registered at
+launch by `SomaFonts.registerBundledFaces()` (`DesignSystem/FontRegistration.swift`)
+with CoreText — not through `UIAppFonts`, because this project generates
+its Info.plist from build settings and Xcode has no `INFOPLIST_KEY_` for
+that key (it is silently ignored). Adding a file here means adding its
+name to `SomaFonts.bundledFiles`.
 
-1. Confirm the files appear in Xcode's file navigator under
-   `Soma/Fonts/` and are checked into the **Soma** target's
-   `Copy Bundle Resources` build phase.
-   (The project uses file-system synchronized groups, so the files
-   should appear automatically — but the target membership is worth
-   double-checking.)
+`SomaTests/BundledFontsTests` checks that every name in
+`SomaFontName.all` resolves with `UIFont(name:)` inside the app host. The
+runtime fallback in `Theme.swift` (`customOrFallback`) still exists, so a
+missing face degrades to Bradley Hand / system serif / SF Mono rather than
+crashing — but the test makes sure that never ships silently.
 
-2. In the **Soma** target's *Build Settings*, add an entry for
-   `Info.plist Values → Application Fonts Resource Path` — or, since
-   this project uses `GENERATE_INFOPLIST_FILE = YES`, add this build
-   setting directly:
+## Updating a face
 
-   ```
-   INFOPLIST_KEY_UIAppFonts = "Caveat-Regular.ttf Caveat-Bold.ttf Fraunces-Regular.ttf Fraunces-Italic.ttf Fraunces-SemiBold.ttf IBMPlexMono-Regular.ttf IBMPlexMono-Medium.ttf"
-   ```
-
-Once that's done, `Theme.swift`'s `customOrFallback` helper notices the
-fonts via `UIFont(name:size:) != nil` and switches over — no code
-change needed.
+Replace the file in place (same name), keep the OFL text next to it, and
+run the test target. If the file name changes, update `SomaFonts.bundledFiles`;
+if the PostScript name changes, update `SomaFontName` too.
 
 ## Why these three
 
 - **Caveat** reads as one specific person's writing. Bradley Hand reads
-  as "system handwritten." The shift from B.H. → Caveat is the single
-  biggest "this is no longer a wellness template" moment in the type
-  system.
+  as "system handwritten." That shift is the single biggest "this is no
+  longer a wellness template" moment in the type system.
 - **Fraunces** has cookbook-title warmth at display sizes and stays
   legible at body sizes via its optical-size axis.
 - **IBM Plex Mono** is the *kitchen ticket* voice — the dot-matrix

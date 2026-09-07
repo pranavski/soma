@@ -19,6 +19,18 @@ export type MealRow = {
   calories_high: number | null;
   protein_g_low: number | null;
   protein_g_high: number | null;
+  /// Parsed by parse-meal since the macros migration, but not read by the
+  /// insight engine until the evidence layer gave fiber a reason to be
+  /// there (see evidence.ts, fiber_x_sleep).
+  fiber_g_low: number | null;
+  fiber_g_high: number | null;
+  /// The two nutrients with the best-quantified, most timing-sensitive
+  /// effects on signals Soma already syncs. Ranges, like every other
+  /// nutrient here — "a coffee" is not a precise dose.
+  caffeine_mg_low: number | null;
+  caffeine_mg_high: number | null;
+  alcohol_g_low: number | null;
+  alcohol_g_high: number | null;
 };
 
 export type CheckinRow = { check_date: string; energy: number };
@@ -47,10 +59,13 @@ export type Coverage = {
   workoutDays: number;
 };
 
+/// What the model returns. Note what is NOT here: confidence is derived from
+/// the supporting-day count in candidates.ts, never self-reported, and every
+/// claim must name the candidate whose numbers it is describing.
 export type ParsedInsight = {
+  candidate_id: string;
   claim: string;
   evidence: string;
-  confidence: "low" | "medium" | "high";
   suggested_action: string | null;
 };
 
@@ -74,7 +89,7 @@ export function hourOfMeal(m: MealRow): number {
 
 // ─── Formatting ─────────────────────────────────────────────────────────────
 
-function fmtSleep(minutes: number): string {
+export function fmtSleep(minutes: number): string {
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;
   return m === 0 ? `${h}h` : `${h}h${String(m).padStart(2, "0")}m`;
@@ -88,6 +103,14 @@ function mealLabel(m: MealRow): string {
   }
   if (m.protein_g_low !== null && m.protein_g_high !== null) {
     notes.push(`~${m.protein_g_low}-${m.protein_g_high}g prot`);
+  }
+  // Only worth a line when there is actually some — "0-0mg caffeine" on
+  // every meal would crowd out the rest of the day for no information.
+  if (m.caffeine_mg_high !== null && m.caffeine_mg_high > 0) {
+    notes.push(`~${m.caffeine_mg_low ?? 0}-${m.caffeine_mg_high}mg caff`);
+  }
+  if (m.alcohol_g_high !== null && m.alcohol_g_high > 0) {
+    notes.push(`~${m.alcohol_g_low ?? 0}-${m.alcohol_g_high}g alc`);
   }
   const hh = String(hourOfMeal(m)).padStart(2, "0");
   return notes.length > 0 ? `${hh}h ${label} (${notes.join(", ")})` : `${hh}h ${label}`;
@@ -202,30 +225,42 @@ export function extractJson(text: string): unknown | null {
   }
 }
 
-const CONFIDENCE_VALUES = ["low", "medium", "high"] as const;
+/// Strict check on the model's output. The response schema already
+/// guarantees the shape, so this is the belt to that suspenders — plus the
+/// one thing a JSON schema cannot express: every claim must cite a
+/// candidate_id that actually exists in the table we sent, and no two claims
+/// may cite the same one.
+///
+/// Anything off rejects the WHOLE payload. A partially-trustworthy insights
+/// run is worse than no run, and the nightly cron will simply try again.
+export function validateInsights(x: unknown, validIds: Set<string>): ParsedInsight[] | null {
+  const items = Array.isArray(x)
+    ? x
+    : (x && typeof x === "object" && Array.isArray((x as { insights?: unknown }).insights))
+      ? (x as { insights: unknown[] }).insights
+      : null;
+  if (items === null) return null;
+  if (items.length > MAX_INSIGHTS) return null;
 
-/// Strict shape check on the model's output. Accepts at most MAX_INSIGHTS;
-/// anything structurally off (wrong enum, empty strings, non-array) rejects
-/// the WHOLE payload — a partially-trustworthy insights run is worse than
-/// no run, and the nightly cron will simply try again.
-export function validateInsights(x: unknown): ParsedInsight[] | null {
-  if (!Array.isArray(x)) return null;
-  if (x.length > MAX_INSIGHTS) return null;
   const out: ParsedInsight[] = [];
-  for (const item of x) {
+  const seen = new Set<string>();
+  for (const item of items) {
     if (!item || typeof item !== "object") return null;
     const o = item as Record<string, unknown>;
+    if (typeof o.candidate_id !== "string") return null;
+    const id = o.candidate_id.trim();
+    // An id we never sent means the finding was invented, not observed.
+    if (!validIds.has(id) || seen.has(id)) return null;
     if (typeof o.claim !== "string" || o.claim.trim().length === 0) return null;
     if (typeof o.evidence !== "string" || o.evidence.trim().length === 0) return null;
-    if (typeof o.confidence !== "string" ||
-        !(CONFIDENCE_VALUES as readonly string[]).includes(o.confidence)) return null;
     if (o.suggested_action !== null && o.suggested_action !== undefined &&
         typeof o.suggested_action !== "string") return null;
     const action = typeof o.suggested_action === "string" ? o.suggested_action.trim() : "";
+    seen.add(id);
     out.push({
+      candidate_id: id,
       claim: o.claim.trim(),
       evidence: o.evidence.trim(),
-      confidence: o.confidence as ParsedInsight["confidence"],
       suggested_action: action.length > 0 ? action : null,
     });
   }

@@ -1,9 +1,13 @@
 // generate-insights
 //
 // The insight engine. Compresses the caller's last 30 days of food logs,
-// energy check-ins, and HealthKit daily aggregates into a per-day digest,
-// hands it to Claude ONCE, and stores the returned correlations as
-// individual insight rows. TypeScript compresses; Claude reasons.
+// energy check-ins, and HealthKit daily aggregates, computes every
+// food-signal association over that window, keeps the ones that survive a
+// permutation test with an FDR correction, and hands that shortlist to
+// Claude ONCE to decide which are worth saying and to write the sentence.
+//
+// TypeScript owns every number. Claude owns judgment and language, and can
+// only describe a candidate we handed it — see validateInsights.
 //
 // Invocation — two auth paths:
 //   1. Cron/batch: Authorization matches INSIGHTS_CRON_SECRET,
@@ -11,14 +15,38 @@
 //   2. On-demand: Authorization is a user JWT, body {} — generates for
 //      the caller. This is what the iOS pull-to-refresh hits.
 //
-// Response:
-//   200 { surfaced: boolean, inserted: number }            — ran
-//   200 { surfaced: false, reason: "insufficient_data" }   — gated, no Claude call
-//   500 { error: "bad_model_output" }                      — model broke contract
+// Response (`candidates` is the shortlist size, so a zero-insight run says
+// whether the statistics found nothing or the model declined what it saw):
+//   200 { surfaced, inserted, candidates, reflections }           — ran
+//   200 { surfaced: false, reason: "insufficient_data", reflections } — gated before scoring
+//   200 { surfaced: false, reason: "no_qualifying_patterns", candidates, reflections } — nothing survived, or nothing chosen
+//   429 { error: "too_soon", retry_after_seconds }                — user path only, see below
+//   500 { error: "claude_call_failed", detail }                   — with the reason
+//   500 { error: "bad_model_output" }                             — model broke contract
 //
-// Dedupe is two-layered: the prompt carries the user's recent claims as
-// "do not repeat", and unique (user_id, claim_norm) in Postgres backstops
-// it — re-runs are inserts that silently no-op on conflict.
+// Past the coverage gate a run is one Claude call, and the on-demand path
+// is a pull gesture on the home screen. So a user-initiated run that lands
+// within INSIGHT_RUN_MIN_GAP_MS of the previous run for that user is
+// refused with a 429 before anything is loaded. The cron path is never
+// throttled (the schedule is its throttle) but records its run the same
+// way, so a pull right after the nightly job is also a no-op. The record
+// lives in insight_runs; see that migration.
+//
+// Every run also rebuilds the caller's `reflections` — plain descriptions of
+// what they logged, which need three days rather than the ten the statistics
+// need. They carry no inference and are replaced wholesale each run; see
+// reflections.ts for why they are templated rather than written by a model.
+//
+// Dedupe is by pattern, not wording: already-surfaced pattern_keys are
+// filtered out before the model is called, and unique (user_id,
+// pattern_key) backstops it — re-runs no-op on conflict.
+//
+// The run is not amnesiac. Every association it measures — survivor or not —
+// is written to pattern_history, and a pattern that has cleared the
+// correction in earlier, largely non-overlapping windows carries that into
+// this run: a higher confidence tier and a line telling the model how long
+// it has held. That memory only ever adds evidence. It never changes which
+// hypotheses are tested, their p-values, or what clears the correction.
 //
 // Secrets required:
 //   ANTHROPIC_API_KEY
@@ -39,10 +67,100 @@ import {
   normalizeClaim,
   validateInsights,
 } from "./digest.ts";
+import {
+  type Candidate,
+  type TestedAssociation,
+  MIN_REPLICATION_GAP_DAYS,
+  independentPriorWindows,
+  renderCandidates,
+  scoreAssociations,
+} from "./candidates.ts";
+import { citation } from "./evidence.ts";
+import { type Reflection, buildReflections } from "./reflections.ts";
 
-const ANTHROPIC_MODEL = "claude-sonnet-4-6";
+// Haiku is the right tier now that the model no longer does arithmetic:
+// what is left is picking plausible rows out of a scored table and writing
+// one hedged sentence each. It is also the cheapest model that supports
+// structured outputs, which is what lets us drop the "return ONLY JSON"
+// pleading from the prompt.
+const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const WINDOW_DAYS = 30;
 const RECENT_CLAIMS_LIMIT = 15;
+
+/// Minimum gap between two user-initiated runs for the same person.
+/// Ten minutes: long enough that a stuck or repeated pull gesture costs
+/// one model call rather than dozens, short enough that someone who just
+/// logged three meals and wants a fresh look isn't told to wait an hour.
+const INSIGHT_RUN_MIN_GAP_MS = 10 * 60 * 1000;
+
+type RunSource = "cron" | "user";
+
+/// Refuse-or-record for the on-demand path. Returns the seconds the caller
+/// should wait when the previous run was too recent, or null when the run
+/// may proceed — in which case it has already been recorded, so two pulls
+/// racing each other resolve to one run and one refusal rather than two
+/// runs. A read failure lets the run proceed: the limit is a cost guard,
+/// not a correctness gate, and a broken guard must not take the feed down.
+async function claimRun(
+  admin: SupabaseClient,
+  userId: string,
+  source: RunSource,
+): Promise<number | null> {
+  const now = new Date();
+  if (source === "user") {
+    const { data, error } = await admin
+      .from("insight_runs")
+      .select("started_at")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (error) {
+      console.error(`generate-insights: insight_runs read failed — ${error.message}`);
+    } else if (data?.started_at) {
+      const elapsed = now.getTime() - new Date(data.started_at as string).getTime();
+      if (elapsed >= 0 && elapsed < INSIGHT_RUN_MIN_GAP_MS) {
+        return Math.ceil((INSIGHT_RUN_MIN_GAP_MS - elapsed) / 1000);
+      }
+    }
+  }
+  const { error: writeErr } = await admin
+    .from("insight_runs")
+    .upsert({ user_id: userId, started_at: now.toISOString(), source }, { onConflict: "user_id" });
+  if (writeErr) {
+    console.error(`generate-insights: insight_runs write failed — ${writeErr.message}`);
+  }
+  return null;
+}
+
+/// How far back pattern_history is kept. Long enough to hold several
+/// non-overlapping windows (so a long-running pattern can accumulate
+/// replication) without growing without bound at ~28 rows per user per day.
+/// Pruned inline on every run rather than by a separate cron: it is one
+/// indexed range delete on the primary key's leading columns.
+const PATTERN_HISTORY_RETENTION_DAYS = 180;
+
+/// Schema the response is constrained to. confidence is absent on purpose —
+/// it is derived from the candidate's supporting-day count, not claimed.
+const RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    insights: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          candidate_id: { type: "string", description: "id of the candidate this describes, e.g. c3" },
+          claim: { type: "string" },
+          evidence: { type: "string" },
+          suggested_action: { anyOf: [{ type: "string" }, { type: "null" }] },
+        },
+        required: ["candidate_id", "claim", "evidence", "suggested_action"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["insights"],
+  additionalProperties: false,
+} as const;
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -61,7 +179,10 @@ async function loadWindow(admin: SupabaseClient, userId: string) {
 
   const [meals, checkins, health] = await Promise.all([
     admin.from("meals")
-      .select("eaten_at,eaten_date,eaten_hour,dish_name,voice_transcript,calories_low,calories_high,protein_g_low,protein_g_high")
+      // fiber has been parsed and stored since the macros migration but was
+      // never selected here, so the engine could not see it. caffeine and
+      // alcohol are new. All three feed evidence-backed pairings.
+      .select("eaten_at,eaten_date,eaten_hour,dish_name,voice_transcript,calories_low,calories_high,protein_g_low,protein_g_high,fiber_g_low,fiber_g_high,caffeine_mg_low,caffeine_mg_high,alcohol_g_low,alcohol_g_high")
       .eq("user_id", userId)
       .gte("eaten_at", startISO)
       .order("eaten_at", { ascending: true }),
@@ -81,41 +202,208 @@ async function loadWindow(admin: SupabaseClient, userId: string) {
   };
 }
 
-// ─── Claude ─────────────────────────────────────────────────────────────────
+// ─── Pattern history ────────────────────────────────────────────────────────
 
-// The copy contract carries the soul of the old insight-rules skill —
-// hedged, never prescriptive, never medical, calories only as ranges —
-// but the finding itself now comes from the model, so the prompt also has
-// to police evidence discipline: real numbers, real day counts, n >= 4.
-const SYSTEM_PROMPT = `You are the insight engine for a food–body journal. You receive a per-day digest of one person's last ~30 days (meals with rough calorie/protein ranges, a 1–5 energy self-report, and daily HealthKit aggregates) plus per-metric coverage counts.
+type HistoryRow = { pattern_key: string; run_date: string };
 
-Find correlations and patterns in THIS person's data. Return ONLY a JSON array — no prose, no markdown, no code fences — of at most ${MAX_INSIGHTS} objects, each EXACTLY:
-{
-  "claim": string,
-  "evidence": string,
-  "confidence": "low" | "medium" | "high",
-  "suggested_action": string | null
+/// How many earlier, largely non-overlapping runs each pattern already
+/// survived. Only survivors count: a pattern that was tested and rejected on
+/// some past night is evidence about itself, but not evidence for itself.
+async function loadPriorWindows(
+  admin: SupabaseClient,
+  userId: string,
+  runDate: string,
+): Promise<Map<string, number>> {
+  const { data, error } = await admin
+    .from("pattern_history")
+    .select("pattern_key,run_date")
+    .eq("user_id", userId)
+    .eq("survived_fdr", true)
+    .lt("run_date", runDate);
+  if (error) {
+    // History is an enhancement, not a dependency. Without it every pattern
+    // reads as a first sighting — exactly how the engine behaved before this
+    // table existed — which is a far better failure than skipping the run.
+    console.error(`generate-insights: pattern_history read failed — ${error.message}`);
+    return new Map();
+  }
+
+  const datesByPattern = new Map<string, string[]>();
+  for (const row of (data ?? []) as HistoryRow[]) {
+    const dates = datesByPattern.get(row.pattern_key);
+    if (dates === undefined) datesByPattern.set(row.pattern_key, [row.run_date]);
+    else dates.push(row.run_date);
+  }
+
+  const out = new Map<string, number>();
+  for (const [patternKey, dates] of datesByPattern) {
+    out.set(patternKey, independentPriorWindows(dates, runDate, MIN_REPLICATION_GAP_DAYS));
+  }
+  return out;
 }
 
+/// Record what this run measured, then drop what has aged out.
+///
+/// The upsert overwrites a same-day row rather than ignoring it: an
+/// on-demand refresh at 9pm has seen more of the day than the 03:30 cron
+/// did, and (user_id, run_date, pattern_key) deliberately treats every run
+/// on one date as a single observation.
+///
+/// Best-effort throughout — failing here costs the engine its memory of
+/// tonight, not tonight's insights.
+async function recordHistory(
+  admin: SupabaseClient,
+  userId: string,
+  runDate: string,
+  tested: TestedAssociation[],
+): Promise<void> {
+  if (tested.length > 0) {
+    const { error } = await admin.from("pattern_history").upsert(
+      tested.map((t) => ({
+        user_id: userId,
+        run_date: runDate,
+        pattern_key: t.patternKey,
+        feature: t.feature,
+        signal: t.signal,
+        lag_days: t.lagDays,
+        n: t.n,
+        rho: t.rho,
+        p_value: t.pValue,
+        survived_fdr: t.survivedFdr,
+      })),
+      { onConflict: "user_id,run_date,pattern_key" },
+    );
+    if (error) {
+      console.error(`generate-insights: pattern_history write failed — ${error.message}`);
+    }
+  }
+
+  const cutoff = new Date();
+  cutoff.setUTCDate(cutoff.getUTCDate() - PATTERN_HISTORY_RETENTION_DAYS);
+  const { error: pruneErr } = await admin
+    .from("pattern_history")
+    .delete()
+    .eq("user_id", userId)
+    .lt("run_date", cutoff.toISOString().slice(0, 10));
+  if (pruneErr) {
+    console.error(`generate-insights: pattern_history prune failed — ${pruneErr.message}`);
+  }
+}
+
+// ─── Reflections ────────────────────────────────────────────────────────────
+
+/// Replace this user's reflection set with what the current log supports.
+///
+/// Replace, not append: a reflection describes the log as it stands and
+/// stops being true the moment another meal is added, so the previous set
+/// is not history worth keeping the way a surfaced insight is. The delete
+/// covers kinds that dropped out — a caffeine reflection must disappear
+/// when the afternoon coffees do, and an upsert alone would leave it there
+/// forever.
+///
+/// Best-effort. Reflections are the consolation prize for not having enough
+/// data yet; failing to write them must never cost the run its insights.
+async function writeReflections(
+  admin: SupabaseClient,
+  userId: string,
+  reflections: Reflection[],
+): Promise<void> {
+  if (reflections.length > 0) {
+    const { error } = await admin.from("reflections").upsert(
+      reflections.map((r, i) => ({
+        user_id: userId,
+        kind: r.kind,
+        body: r.body,
+        detail: r.detail,
+        sort_order: i,
+        window_days: WINDOW_DAYS,
+        generated_at: new Date().toISOString(),
+      })),
+      { onConflict: "user_id,kind" },
+    );
+    if (error) {
+      console.error(`generate-insights: reflections write failed — ${error.message}`);
+      // Leaving the stale set in place beats deleting it and writing
+      // nothing, so give up on the whole operation rather than falling
+      // through to the delete below.
+      return;
+    }
+  }
+
+  const keep = reflections.map((r) => r.kind);
+  let stale = admin.from("reflections").delete().eq("user_id", userId);
+  if (keep.length > 0) stale = stale.not("kind", "in", `(${keep.join(",")})`);
+  const { error: delErr } = await stale;
+  if (delErr) {
+    console.error(`generate-insights: reflections prune failed — ${delErr.message}`);
+  }
+}
+
+// ─── Claude ─────────────────────────────────────────────────────────────────
+
+// The statistics are settled before this prompt is built, so the model's job
+// is editorial: which of these survived-the-math associations are plausible
+// enough to say to a person, and how to say them. The copy contract carries
+// the soul of the insight-rules skill — hedged, never prescriptive, never
+// medical, calories only as ranges.
+const SYSTEM_PROMPT = `You are the insight engine for a food–body journal. You receive a shortlist of statistical associations already computed from one person's last ~30 days, plus the daily digest they were computed from.
+
+Every candidate has already passed a permutation test with a false-discovery-rate correction. The arithmetic is done: n, rho, and the compared group averages are given to you. Do not recompute them, and do not cite any number that is not in the candidate line you are describing.
+
+Your job is judgment and language. For each candidate, decide whether it is worth telling this person about — a real, interpretable pattern in how they eat and how they feel — or whether it is a coincidence dressed up as a finding (spurious pairings, reversed causality, an association nobody could act on or even notice). Then write it.
+
+Select at most ${MAX_INSIGHTS} candidates. Selecting none is a good, honest answer; describing a candidate you do not believe is not.
+
 Rules — non-negotiable:
-- claim: one sentence naming a specific pattern in the data with real numbers from the digest (e.g. "Energy dips to 2/5 tend to follow sub-20g-protein mornings — 5 of the 6 such days"). NEVER generic nutrition advice. Hedged language only: "tends to", "seems", "is associated with". Never "causes", "makes you", "you should".
-- evidence: the supporting observation spelled out — which days, how many, the compared values (e.g. "mean energy 2.2/5 after the 6 low-protein mornings vs 3.6/5 after the 9 higher-protein ones").
-- confidence: high only for a consistent pattern with n ≥ 8 supporting days; medium for n ≥ 6; low otherwise.
-- A pattern needs at least 4 supporting days to be claimed at all. Fewer than 4 → do not include it.
-- Respect the coverage counts: never claim a trend in a metric with fewer than 4 days of data. Never treat a missing metric on a day as zero — missing means not synced.
+- claim: one sentence naming the pattern, using the numbers from that candidate's line (e.g. "Energy tends to run lower the day after your latest dinners — 2.2 of 5 across those 7 days against 3.6 on the earlier 9"). NEVER generic nutrition advice. Hedged language only: "tends to", "seems", "is associated with". Never "causes", "makes you", "you should".
+- evidence: the supporting observation spelled out — how many days on each side, and both compared averages.
+- Never name a statistic in the copy. rho, p-values, and "correlation" are given to you so you can judge strength; the reader gets the comparison, not the coefficient. "n=14" is fine as "14 days".
+- Some candidates say they "have held across N separate windows". That means the same pattern passed the same test on largely different stretches of this person's data, weeks apart — it is the strongest evidence you have that something is real rather than a coincidence, so weigh it heavily when choosing what to say. You may reflect it in plain language ("this has kept showing up over the past couple of months"), never as a count of runs, tests, or windows.
 - suggested_action: a single gentle, observational next step ("worth watching whether earlier dinners shift this"), or null. Never prescriptive ("eat less X"), never a target, never medical.
 - Calories only ever as ranges ("~550–700"), never a bare number.
-- You will be given claims already shown to this person. Do not repeat or rephrase any of them — only genuinely new patterns.
-- If nothing meets the bar, return []. An empty array is a good answer; an invented pattern is not.`;
+- An association is not causation, and the copy must never imply it is.
+- You will be given claims already shown to this person. Do not repeat or rephrase any of them.
+- Set candidate_id to the id of the candidate each insight describes.
+
+Published evidence — how to use it, and its hard limit:
+- Some candidate lines carry a "published evidence" note: what the research literature expects for that pairing, how strong that literature is (grade A/B/C), and whether THIS person's data points the same way.
+- Use it to judge plausibility. A candidate that matches a grade-A finding is far more likely to be real than a coincidence, and needs less hesitation from you. A candidate with no published evidence is not thereby wrong — most of what a person notices about themselves has never been studied — but it deserves a harder look for whether it is interpretable at all.
+- When a candidate points the OPPOSITE way to the literature, say what this person's data says. Do not soften it toward the published result, do not average the two, and do not mention that a disagreement exists. Their body is the subject; the literature is context.
+- You must NOT write the science. Do not state mechanisms, do not explain physiology, do not cite, quote, name, or allude to any study, and do not reuse the wording of the evidence note. The app attaches the published context itself, from its own reviewed source table, after you have chosen. Your sentence is about this person and only this person.
+- Anything you write that reads as a general nutrition fact rather than an observation about these 30 days is a failure of the task, even when it is true.`;
+
+/// The four evidence columns for one insight row, or empty when there is
+/// nothing sound to attach.
+///
+/// All four or none — `insights_evidence_all_or_nothing` enforces the same
+/// rule in the database, because a mechanism without a citation is an
+/// unsourced health claim.
+///
+/// The `corroborated` gate is the substantive decision here. A candidate can
+/// carry an evidence row while pointing the opposite way to it; in that case
+/// the finding is still surfaced (the person's own data is the subject) but
+/// no mechanism is attached, because the only mechanism available explains
+/// something that did not happen to them.
+function evidenceColumns(c: Candidate): Record<string, string> {
+  if (c.evidence === undefined || c.agreement !== "corroborated") return {};
+  return {
+    mechanism: c.evidence.mechanism,
+    evidence_source_id: c.evidence.id,
+    evidence_grade: c.evidence.grade,
+    evidence_citation: citation(c.evidence),
+  };
+}
 
 function buildUserMessage(
+  candidates: Candidate[],
   digestLines: string[],
   coverage: string,
   priorClaims: string[],
 ): string {
   const blocks: string[] = [
+    `Candidate associations (already tested and corrected — these are the only things you may describe):\n${renderCandidates(candidates)}`,
     `Per-metric coverage over the window:\n${coverage}`,
-    `Daily digest (missing metrics = not synced, NOT zero):\n${digestLines.join("\n")}`,
+    `Daily digest, for context on whether each candidate is plausible (missing metrics = not synced, NOT zero):\n${digestLines.join("\n")}`,
   ];
   if (priorClaims.length > 0) {
     blocks.push(
@@ -123,13 +411,19 @@ function buildUserMessage(
         priorClaims.map((c) => `- ${c}`).join("\n"),
     );
   }
-  blocks.push("Return the JSON array now.");
+  blocks.push("Select and write the insights now.");
   return blocks.join("\n\n");
 }
 
-async function callClaude(userMessage: string): Promise<string | null> {
+/// Why a call failed, not just that it did. This job runs unattended
+/// nightly across every active user; "claude_call_failed" with no reason
+/// is indistinguishable between a missing key, a rate limit, and a
+/// malformed request, and there is no one watching to reproduce it.
+type ClaudeResult = { ok: true; text: string } | { ok: false; reason: string };
+
+async function callClaude(userMessage: string): Promise<ClaudeResult> {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) return null;
+  if (!apiKey) return { ok: false, reason: "missing_api_key" };
   let res: Response;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -141,41 +435,63 @@ async function callClaude(userMessage: string): Promise<string | null> {
       },
       body: JSON.stringify({
         model: ANTHROPIC_MODEL,
-        max_tokens: 2000,
+        // max_tokens covers thinking AND the response. At 4096 against a
+        // 2048 thinking budget, roughly one run in ten spent the remainder
+        // deliberating and stopped before emitting any text at all
+        // (stop_reason=max_tokens, no text block). Five insights need well
+        // under 2000 tokens; the headroom is what keeps a nightly run from
+        // failing on a long deliberation.
+        max_tokens: 8192,
+        // Haiku 4.5 predates adaptive thinking, so this is the older fixed
+        // budget form (must be < max_tokens). Modest, but the plausible-vs-
+        // spurious call is the whole reason a model is in this loop.
+        thinking: { type: "enabled", budget_tokens: 2048 },
+        output_config: { format: { type: "json_schema", schema: RESPONSE_SCHEMA } },
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }],
       }),
     });
-  } catch {
-    return null;
+  } catch (e) {
+    return { ok: false, reason: `fetch_failed: ${e instanceof Error ? e.message : e}` };
   }
-  if (!res.ok) return null;
-  let payload: { content?: { type?: string; text?: string }[] };
+  if (!res.ok) {
+    // The error body carries the API's own explanation (rate_limit_error,
+    // invalid_request_error and which field, overloaded_error). It never
+    // contains the key.
+    const body = await res.text().catch(() => "");
+    return { ok: false, reason: `http_${res.status}: ${body.slice(0, 400)}` };
+  }
+  let payload: { content?: { type?: string; text?: string }[]; stop_reason?: string };
   try {
     payload = await res.json();
   } catch {
-    return null;
+    return { ok: false, reason: "response_not_json" };
   }
   const text = payload?.content?.find((b) => b?.type === "text")?.text;
-  return typeof text === "string" ? text : null;
+  if (typeof text !== "string") {
+    // A thinking-only response means the budget swallowed the answer;
+    // stop_reason tells us which.
+    return { ok: false, reason: `no_text_block (stop_reason=${payload?.stop_reason ?? "?"})` };
+  }
+  return { ok: true, text };
 }
 
 // ─── Auth ───────────────────────────────────────────────────────────────────
 
-/// Resolve the target user from one of the two auth paths. Returns null
-/// when neither path authenticates.
+/// Resolve the target user from one of the two auth paths, and say which
+/// path it was. Returns null when neither path authenticates.
 async function resolveUser(
   req: Request,
   body: { user_id?: string },
   supabaseUrl: string,
   anonKey: string,
-): Promise<string | null> {
+): Promise<{ userId: string; source: RunSource } | null> {
   const auth = req.headers.get("Authorization") ?? "";
   if (!auth.startsWith("Bearer ")) return null;
 
   const cronSecret = Deno.env.get("INSIGHTS_CRON_SECRET");
   if (cronSecret && auth === `Bearer ${cronSecret}`) {
-    return body.user_id ?? null;
+    return body.user_id ? { userId: body.user_id, source: "cron" } : null;
   }
 
   // User-JWT path: let Supabase verify the token.
@@ -184,7 +500,7 @@ async function resolveUser(
   });
   const { data, error } = await userClient.auth.getUser();
   if (error || !data?.user?.id) return null;
-  return data.user.id;
+  return { userId: data.user.id, source: "user" };
 }
 
 // ─── Entrypoint ─────────────────────────────────────────────────────────────
@@ -204,16 +520,75 @@ serve(async (req) => {
   const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-  const userId = await resolveUser(req, body, supabaseUrl, anonKey);
-  if (!userId) return json(401, { error: "unauthorized" });
+  const caller = await resolveUser(req, body, supabaseUrl, anonKey);
+  if (!caller) return json(401, { error: "unauthorized" });
+  const { userId, source } = caller;
 
   const admin = createClient(supabaseUrl, serviceKey);
+
+  const retryAfter = await claimRun(admin, userId, source);
+  if (retryAfter !== null) {
+    return json(429, { error: "too_soon", retry_after_seconds: retryAfter });
+  }
 
   const { meals, checkins, health } = await loadWindow(admin, userId);
   const { lines, coverage } = buildDigest(meals, checkins, health);
 
+  // Before the gate, and on every run rather than only on gated ones. The
+  // statistics need ~10 days of paired data; a description of the log needs
+  // 3, and that gap is the whole reason this layer exists. Recomputed even
+  // once insights are flowing so the set never goes stale — the client
+  // decides whether to show it (see InsightsViewModel).
+  const reflections = buildReflections(meals, checkins, health);
+  await writeReflections(admin, userId, reflections);
+
   if (!hasSufficientData(coverage)) {
-    return json(200, { surfaced: false, inserted: 0, reason: "insufficient_data" });
+    return json(200, {
+      surfaced: false,
+      inserted: 0,
+      reason: "insufficient_data",
+      reflections: reflections.length,
+    });
+  }
+
+  const runDate = new Date().toISOString().slice(0, 10);
+
+  // Everything already shown to this person (by pattern rather than by
+  // wording — a rephrase of a surfaced finding never reaches the model), and
+  // how many earlier windows each pattern has already held across. Two
+  // independent reads of this user's own rows.
+  const [seen, priorWindows] = await Promise.all([
+    admin.from("insights").select("pattern_key").eq("user_id", userId),
+    loadPriorWindows(admin, userId, runDate),
+  ]);
+  const seenPatterns = new Set(
+    ((seen.data ?? []) as { pattern_key: string }[]).map((r) => r.pattern_key),
+  );
+
+  const { tested, candidates: scored } = scoreAssociations(meals, checkins, health, {
+    priorWindows,
+  });
+
+  // Recorded before the shortlist is thinned and before the model is called.
+  // What this run measured is just as true on a night that surfaces nothing,
+  // and the rejections are what a replication rate is measured against.
+  await recordHistory(admin, userId, runDate, tested);
+
+  const candidates = scored
+    .filter((c) => !seenPatterns.has(c.patternKey))
+    // Re-number so the ids the model cites are contiguous.
+    .map((c, i) => ({ ...c, id: `c${i + 1}` }));
+
+  // Nothing survived the correction, or everything that did is old news.
+  // Either way there is no call to make.
+  if (candidates.length === 0) {
+    return json(200, {
+      surfaced: false,
+      inserted: 0,
+      reason: "no_qualifying_patterns",
+      candidates: 0,
+      reflections: reflections.length,
+    });
   }
 
   const { data: prior } = await admin
@@ -224,17 +599,29 @@ serve(async (req) => {
     .limit(RECENT_CLAIMS_LIMIT);
   const priorClaims = (prior ?? []).map((r: { claim: string }) => r.claim);
 
-  const text = await callClaude(
-    buildUserMessage(lines, coverageSummary(coverage), priorClaims),
+  const result = await callClaude(
+    buildUserMessage(candidates, lines, coverageSummary(coverage), priorClaims),
   );
-  if (text === null) return json(500, { error: "claude_call_failed" });
+  if (!result.ok) {
+    console.error(`generate-insights: claude call failed — ${result.reason}`);
+    return json(500, { error: "claude_call_failed", detail: result.reason });
+  }
 
-  const parsed = extractJson(text);
-  const insights = parsed === null ? null : validateInsights(parsed);
+  const byId = new Map(candidates.map((c) => [c.id, c]));
+  const parsed = extractJson(result.text);
+  const insights = parsed === null ? null : validateInsights(parsed, new Set(byId.keys()));
   if (insights === null) return json(500, { error: "bad_model_output" });
 
   if (insights.length === 0) {
-    return json(200, { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" });
+    // Distinct from the branch above: candidates existed, the model judged
+    // none of them worth saying. `candidates` separates the two in logs.
+    return json(200, {
+      surfaced: false,
+      inserted: 0,
+      reason: "no_qualifying_patterns",
+      candidates: candidates.length,
+      reflections: reflections.length,
+    });
   }
 
   // ignoreDuplicates makes conflicting rows silent no-ops; .select() then
@@ -242,21 +629,46 @@ serve(async (req) => {
   const { data: insertedRows, error: insErr } = await admin
     .from("insights")
     .upsert(
-      insights.map((i) => ({
-        user_id: userId,
-        claim: i.claim,
-        evidence: i.evidence,
-        confidence: i.confidence,
-        suggested_action: i.suggested_action,
-        window_days: WINDOW_DAYS,
-        claim_norm: normalizeClaim(i.claim),
-        model: ANTHROPIC_MODEL,
-      })),
-      { onConflict: "user_id,claim_norm", ignoreDuplicates: true },
+      insights.map((i) => {
+        const c = byId.get(i.candidate_id)!;
+        return {
+          user_id: userId,
+          claim: i.claim,
+          evidence: i.evidence,
+          // Derived from the supporting-day count, not from the model.
+          confidence: c.confidence,
+          suggested_action: i.suggested_action,
+          window_days: WINDOW_DAYS,
+          pattern_key: c.patternKey,
+          support_days: c.n,
+          // The other half of what confidence was derived from, recorded for
+          // the same reason as support_days: so a tier can be audited.
+          support_windows: c.windows,
+          claim_norm: normalizeClaim(i.claim),
+          model: ANTHROPIC_MODEL,
+          // The scientific half of the card, joined here rather than
+          // returned by the model. Claude picked the candidate; the
+          // mechanism and citation come out of the reviewed table keyed by
+          // that candidate, so there is no path by which a citation can be
+          // invented — the same guarantee that already covers every number.
+          //
+          // Attached only when this person's data agrees with the published
+          // direction. A contradicting finding still surfaces, but pairing
+          // it with a mechanism that explains the opposite of what they
+          // experienced would be worse than saying nothing.
+          ...evidenceColumns(c),
+        };
+      }),
+      { onConflict: "user_id,pattern_key", ignoreDuplicates: true },
     )
     .select("id");
   if (insErr) return json(500, { error: "insert_failed", detail: insErr.message });
 
   const inserted = insertedRows?.length ?? 0;
-  return json(200, { surfaced: inserted > 0, inserted });
+  return json(200, {
+    surfaced: inserted > 0,
+    inserted,
+    candidates: candidates.length,
+    reflections: reflections.length,
+  });
 });

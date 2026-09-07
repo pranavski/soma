@@ -49,6 +49,8 @@ One row per meal logged.
 | `dish_name`      | text           | Normalized dish name for the repeat-dish rule. Lowercased, trimmed. |
 | `calories_low`   | int            | Range low. **UI always shows a range, never a bare number.** |
 | `calories_high`  | int            | Range high. `check (calories_high >= calories_low)`. |
+| `caffeine_mg_low` / `caffeine_mg_high` | int | Milligrams of caffeine, whole meal. Anchored at parse time against a USDA/NIAAA standard-serving table (`parse-meal/fdc.ts`) rather than estimated freehand — the insight engine's `caffeine_mg_late` feature sums these from 14:00 onward. |
+| `alcohol_g_low` / `alcohol_g_high` | int | Grams of pure ethanol, whole meal. One US standard drink = 14 g. Feeds `alcohol_g_evening` (17:00 onward). |
 | `parse_status`   | text not null default `'pending'` | check in (`'pending'`,`'parsed'`,`'failed'`,`'manual'`) |
 | `parsed_at`      | timestamptz    | Set when `parse-meal` completes. |
 | `created_at`     | timestamptz default `now()` | |
@@ -89,6 +91,14 @@ The once-a-day energy + mood check-in.
 ### `health_days`
 Daily HealthKit aggregates. **Raw HealthKit reads stay on device.**
 
+Synced by `HealthKitSync` over a trailing 30-day window — matching the
+insight engine's `WINDOW_DAYS`, so a fresh connection doesn't leave the
+oldest scored days empty. Three triggers: the Settings sheet's
+connect/sync-now, an `HKObserverQuery` background wakeup (throttled to 3h),
+and app foreground (throttled to 6h). Days with no signal at all are
+skipped rather than written as an all-nil row, which would blank an earlier
+good sync and drop that day's tier.
+
 | column               | type           | notes |
 |----------------------|----------------|-------|
 | `id`                 | uuid pk        | |
@@ -107,10 +117,12 @@ Daily HealthKit aggregates. **Raw HealthKit reads stay on device.**
 | `updated_at`         | timestamptz default `now()` | trigger-maintained |
 
 ### `insights`
-Zero or more LLM-found correlations per run — **not** one templated
-finding per ISO week. `generate-insights` runs nightly (plus on-demand)
-over a rolling window and inserts whatever genuinely new patterns Claude
-finds, up to 5 per run. See `insight-rules` for how a pattern qualifies.
+Zero or more statistically-screened correlations per run — **not** one
+templated finding per ISO week. `generate-insights` runs nightly (plus
+on-demand) over a rolling window: TypeScript scores every food–body
+association and keeps what survives an FDR correction, then Claude selects
+from those survivors and writes them, up to 5 per run. See `insight-rules`
+for how a pattern qualifies.
 
 | column             | type          | notes |
 |--------------------|---------------|-------|
@@ -118,14 +130,106 @@ finds, up to 5 per run. See `insight-rules` for how a pattern qualifies.
 | `user_id`          | uuid not null | |
 | `claim`            | text not null | One hedged sentence naming the pattern, carrying real numbers from the digest. |
 | `evidence`         | text not null | The supporting comparison spelled out — which days, how many, the compared values. |
-| `confidence`       | text not null | check in (`'low'`,`'medium'`,`'high'`). `high` needs n≥8 supporting days, `medium` n≥6, `low` down to the n≥4 floor. |
+| `confidence`       | text not null | check in (`'low'`,`'medium'`,`'high'`). Derived from `support_days` **and** `support_windows`, never self-reported by the model: `high` needs n≥8, `medium` n≥6, `low` down to the n≥4 floor, then **one** tier of promotion if the pattern also held in an earlier, non-overlapping window. |
 | `suggested_action` | text          | Nullable. A single gentle, observational next step. Never prescriptive, never a target, never medical. |
 | `window_days`      | int not null  | The lookback window used to find the claim; currently 30. |
-| `claim_norm`       | text not null | Lowercased, alphanumerics-only, whitespace-collapsed form of `claim`. **unique `(user_id, claim_norm)`** — the storage-layer "never repeat itself" backstop; the prompt-level "already surfaced" list (see `insight-rules`) is best-effort, this is the guarantee. |
-| `model`            | text          | e.g. `'claude-sonnet-4-6'`. |
+| `pattern_key`      | text not null | The association's identity, independent of wording: `'<feature>_x_<signal>_lag<0\|1>'`. **unique `(user_id, pattern_key)`** — the "never repeat itself" guarantee, and the Edge Function's upsert conflict target. A rephrased repeat collides here where `claim_norm` would have missed it. |
+| `support_days`     | int not null  | Paired days behind the association (check `>= 4`). Half of what `confidence` is derived from, kept so a claim can be audited against its own evidence base. |
+| `support_windows`  | int not null default 1 | Separate windows the association had held across when the claim was written (check `>= 1`), counted from `pattern_history`. The other half of `confidence`, recorded for the same audit reason. |
+| `claim_norm`       | text not null | Lowercased, alphanumerics-only, whitespace-collapsed form of `claim`. Retained for debugging; no longer carries a uniqueness constraint (`pattern_key` subsumes it). |
+| `mechanism`        | text          | Nullable. One declarative sentence of general physiology, shown to the reader under "why this might happen". **Copied verbatim from `generate-insights/evidence.ts`, never written by the model** — Claude picks the candidate, TypeScript joins the science. Same division as numbers. |
+| `evidence_source_id` | text        | Nullable. Stable id of the evidence row (e.g. `'caffeine_late_x_sleep'`). The join key a future meal-plan feature composes against — see `docs/meal-plans-design.md`. Indexed. |
+| `evidence_grade`   | text          | Nullable, check in (`'A'`,`'B'`,`'C'`). Strength of the *literature*, not of this person's pattern (that is `confidence`). |
+| `evidence_citation`| text          | Nullable. Rendered citation, denormalised at write time so a surfaced claim keeps the reference it was shown with. |
+| `model`            | text          | e.g. `'claude-haiku-4-5'`. |
 | `created_at`       | timestamptz default `now()` | |
 
 Index: `(user_id, created_at desc)` — for the "recent claims" prompt context and the Insights feed.
+Index: `(evidence_source_id) where evidence_source_id is not null` — "which findings lean on which science".
+
+The four evidence columns are all-or-nothing (`insights_evidence_all_or_nothing`):
+a mechanism without a citation is an unsourced health claim, and the constraint
+makes that unrepresentable. They are null for most rows, which is the honest
+shape — most of what someone notices about themselves has never been studied,
+and those findings still surface, just without a clipping attached.
+
+### `pattern_history`
+The insight engine's memory: **every association a run measured, survivor or
+not**. Without it each nightly run is amnesiac — it re-derives the same ~28
+hypotheses from a window overlapping yesterday's by 29 days and has no idea
+it has seen them before. Written by `generate-insights` on every run that
+gets past the coverage gate, including runs that surface nothing.
+
+Rejected associations are recorded deliberately: they are the denominator.
+With only survivors on file, "how often does a finding replicate" has no
+answer. A pairing skipped for having too few paired days is simply absent —
+it was not tested, so it neither passed nor failed.
+
+| column         | type          | notes |
+|----------------|---------------|-------|
+| `user_id`      | uuid not null | |
+| `run_date`     | date not null | The run's date, not a timestamp. On-demand refresh can fire many times a day over near-identical data; those are one observation, and the primary key collapses them. |
+| `pattern_key`  | text not null | Identical to `insights.pattern_key`, so a surfaced claim joins to its own measurement history. |
+| `feature`      | text not null | |
+| `signal`       | text not null | |
+| `lag_days`     | smallint not null | check in (0, 1). |
+| `n`            | int not null  | Paired days behind this measurement. |
+| `rho`          | real not null | Spearman ρ, check in [-1, 1]. |
+| `p_value`      | real not null | Permutation p-value, check in (0, 1]. |
+| `survived_fdr` | boolean not null | Whether it cleared Benjamini–Hochberg **this run**. |
+| `created_at`   | timestamptz default `now()` | |
+
+Primary key `(user_id, run_date, pattern_key)`. Partial index
+`(user_id, pattern_key, run_date desc) where survived_fdr` — the replication
+lookup.
+
+**RLS:** owner can read (it is the audit trail behind claims about their own
+body); **no** insert/update/delete policy for any client role. A client able
+to write here could manufacture the evidence behind its own insights.
+`generate-insights` is the only writer, via the service role.
+
+Growth is ~28 rows per active user per day; `generate-insights` prunes rows
+older than 180 days inline on every run, so no separate cron is needed.
+
+### `reflections`
+What the app can honestly say **before the statistics can say anything** —
+plain descriptions of the log ("your last meal has landed between 19:00 and
+21:00 across these 5 days"), never an inference from it.
+
+They exist because the engine cannot produce a finding from fewer than about
+ten days of paired data, and that is a property of the mathematics rather
+than a tunable: the smallest two-tailed p-value a permutation test can
+report from n days is 2/n!, which sits above the Benjamini–Hochberg
+threshold until n≈7. Measured over synthetic windows, detection of a
+*planted, deterministic* effect is 0% at 3–7 logged days while the
+false-positive rate is already 1–3%. Loosening the coverage gate would not
+make findings arrive sooner — it would make the first thing a new user reads
+a false positive. A description needs no correction to be true, so it can
+carry the first week instead. See the `insight-rules` skill.
+
+| column         | type              | notes |
+|----------------|-------------------|-------|
+| `user_id`      | uuid not null     | |
+| `kind`         | text not null     | Which observation (`meal_timing`, `repeat_dish`, …). Stable across runs — that is what makes it the identity. Not an enum; the client renders whatever arrives, so new kinds ship server-side without an app update. |
+| `body`         | text not null     | The observation, one sentence. |
+| `detail`       | text not null     | The counts underneath it, set quieter in the UI. |
+| `sort_order`   | smallint not null | Server-side order, so the client does not re-derive the priority/group rules. |
+| `window_days`  | smallint not null | |
+| `generated_at` | timestamptz default `now()` | |
+
+Primary key `(user_id, kind)` — a **snapshot, not a feed**. An insight is a
+finding about a window and stays true, so `insights` never repeats and never
+deletes; a reflection describes the log as it currently stands and is wrong
+the moment another meal is added, so each run replaces the whole set (upsert
+on the key, then delete the kinds that dropped out). At most
+`MAX_REFLECTIONS` rows per user, so no retention job is needed.
+
+No model, no confidence, no evidence columns: the copy is templated in
+`reflections.ts` from numbers computed there, because a description has no
+selection judgment to delegate.
+
+**RLS:** owner can read; **no** insert/update/delete policy for any client
+role. `generate-insights` is the only writer, via the service role.
 
 ---
 
@@ -140,9 +244,11 @@ create policy "owner can update" on <t> for update using (auth.uid() = user_id);
 create policy "owner can delete" on <t> for delete using (auth.uid() = user_id);
 ```
 
-`insights` is written by the `generate-insights` Edge Function using the
-**service role** (which bypasses RLS); rows still carry the correct `user_id`
-so client reads work under the owner-can-read policy.
+`insights` and `pattern_history` are written by the `generate-insights` Edge
+Function using the **service role** (which bypasses RLS); rows still carry the
+correct `user_id` so client reads work under the owner-can-read policy.
+`pattern_history` carries **only** that read policy — no client role may write
+to the evidence behind its own insights.
 
 ---
 
@@ -176,6 +282,26 @@ calls Claude (`claude-sonnet-4-6`) with the structured-output contract
 below, then **updates the `meals` row** and inserts `meal_items` rows
 using the service role.
 
+**Menu awareness.** A deterministic gate (`parse-meal/venue.ts`) checks the
+transcript for a restaurant, chain, packaged brand, or a `from X` / `at X`
+phrase. On a hit, and only then, the prompt gains a block naming the
+operator and telling Claude to treat the item as that operator's product:
+base the figures on the published menu it knows, build the items from what
+that kitchen actually puts in it, and keep the operator in `dish_name`
+("grilled cheese from starbucks") so it never collapses into another
+kitchen's version in the repeat chips, `dish_aliases`, or the repeat-dish
+insight rule. A chain whose figures the model knows may carry a range
+tighter than the 25% rule — a menu item is a standardized quantity, the
+same reasoning as the caffeine anchors in `fdc.ts`. A place it does not
+know is estimated at restaurant portion and preparation at the normal
+width; the prompt forbids narrowing on a menu it can't actually recall.
+
+This is prompt context only: no tool, no search, no recipient beyond
+Anthropic, so it sits inside the existing consent. The capture sheet has
+an optional "where —" field that folds into the transcript as
+"…, from <place>", so the gate reads a typed place and a spoken one the
+same way. Home cooking, which is most meals, never gets the block.
+
 **Claude output contract** (strict JSON, validated server-side):
 ```json
 {
@@ -205,7 +331,7 @@ and sets `meals.parse_status = 'failed'`. The iOS decoder must handle this
    (`edge_function_base_url`, `insights_cron_secret`); the Edge Function
    authorizes the request by comparing the bearer token against the
    `INSIGHTS_CRON_SECRET` env var. The run is idempotent per user
-   (`claim_norm` dedupe), so a nightly re-run only inserts genuinely new
+   (`pattern_key` dedupe), so a nightly re-run only inserts genuinely new
    claims.
 2. On-demand: caller's own JWT as the bearer token, empty body `{}`. This
    is what the iOS Insights screen's pull-to-refresh hits.
@@ -216,29 +342,66 @@ and sets `meals.parse_status = 'failed'`. The iOS decoder must handle this
 2. Compress into one line per day that has any signal, ascending by date,
    plus a per-metric coverage count. Missing metrics are **omitted** from
    the line, never rendered as zero.
-3. Gate: skip the Claude call entirely unless the window has **≥ 7 days
+3. Rebuild `reflections` — plain descriptions of the log, which need 3
+   logged days rather than the ~10 the statistics need. Computed before the
+   gate and on **every** run (not only gated ones), templated in
+   TypeScript with no model call, and replacing the previous set wholesale.
+   See `insight-rules` for why they may never relate a food feature to a
+   body signal.
+4. Gate: skip the Claude call entirely unless the window has **≥ 7 days
    with a meal logged AND ≥ 7 days of the single best-covered body
    signal** (energy check-in counts as the tier-0 body signal; coverage
-   is the max across metrics, not the sum — see `insight-rules`).
-4. Fetch the user's last 15 claims, most recent first, as a "do not
-   repeat" list for the prompt.
-5. Call Claude once with the digest + coverage counts + prior claims. It
-   returns a JSON array (at most 5) of
-   `{ claim, evidence, confidence, suggested_action }` per the copy
-   contract in `insight-rules`. An empty array is a valid, good answer —
-   "nothing qualifies" beats an invented pattern.
-6. Strict server-side validation of the model's output. Any structural
-   violation (wrong enum, empty string, more than 5 items, non-array)
-   rejects the **whole** payload — a partially-trustworthy run is worse
-   than no run; the next nightly/on-demand call just tries again.
-7. Upsert the validated claims with `onConflict: "user_id,claim_norm"`,
-   `ignoreDuplicates: true` — re-runs are safe no-ops for anything
-   already surfaced.
+   is the max across metrics, not the sum — see `insight-rules`). Note
+   this gate is *not* what makes findings take two weeks: below ~8 paired
+   days the permutation test plus the FDR correction cannot produce a real
+   finding at any threshold, which is why the answer to "surface something
+   sooner" is step 3 and not a smaller number here.
+5. Score candidate associations in TypeScript (`candidates.ts`): an
+   allowlist of 14 food-feature × body-signal pairings (not the 48-way
+   cross-product — every extra hypothesis tightens the threshold for the
+   rest), each tested at 2 lags and needing ≥ 4 paired days, scored with
+   Spearman ρ and a 10,000-shuffle seeded permutation p-value, then
+   filtered by Benjamini–Hochberg at q = 0.10. Survivors are then thinned
+   twice, both *after* the correction: one lag per pairing, and one finding
+   per group of features that restate each other for this person (features
+   correlating at |ρ| ≥ 0.7 against the same signal and lag). Ranked by |ρ|
+   and capped at 20. See `insight-rules` for why the correction is
+   load-bearing, why the allowlist exists, and why q stays at 0.10.
+6. Fold in replication from `pattern_history`: for each candidate, count the
+   earlier runs where it survived, keeping only runs ≥ 15 days apart
+   (consecutive nightly windows share 29 of 30 days, so nightly survival is
+   near-tautological). Holding across ≥ 2 such windows promotes `confidence`
+   by exactly one tier, and the candidate line tells the model how many
+   windows it has held across. **Replication never changes which hypotheses
+   are tested, their p-values, or what clears the correction** — it adds
+   evidence, it does not lower the bar.
+7. Write every association tested this run — survivor or not — to
+   `pattern_history`, then prune rows older than 180 days. This happens
+   before the shortlist is thinned and before Claude is called, so a night
+   that surfaces nothing still records what it measured.
+8. Drop any candidate whose `pattern_key` the user has already been shown.
+   If none remain, return without calling Claude.
+9. Fetch the user's last 15 claims, most recent first, to keep phrasing
+   fresh in the prompt.
+10. Call Claude once (`claude-haiku-4-5`) with the candidate table + digest
+   + coverage counts + prior claims, constrained by a JSON response
+   schema. It selects at most 5 candidates and returns
+   `{ candidate_id, claim, evidence, suggested_action }` each, per the copy
+   contract in `insight-rules`. Selecting none is a valid, good answer —
+   "nothing worth saying" beats an invented pattern. `confidence` is
+   **not** returned; it is derived from `support_days` and `support_windows`.
+11. Strict server-side validation. Any structural violation, an unknown or
+    reused `candidate_id`, or more than 5 items rejects the **whole**
+    payload — a partially-trustworthy run is worse than no run; the next
+    nightly/on-demand call just tries again.
+12. Upsert the validated claims with `onConflict: "user_id,pattern_key"`,
+    `ignoreDuplicates: true` — re-runs are safe no-ops for anything
+    already surfaced.
 
 **Response:**
-- `200 { surfaced: boolean, inserted: number }` — ran.
-- `200 { surfaced: false, inserted: 0, reason: "insufficient_data" }` — gated before the Claude call.
-- `200 { surfaced: false, inserted: 0, reason: "no_qualifying_patterns" }` — Claude returned `[]`.
+- `200 { surfaced: boolean, inserted: number, candidates: number, reflections: number }` — ran.
+- `200 { surfaced: false, inserted: 0, reason: "insufficient_data", reflections }` — gated before scoring. `reflections` is how many descriptions were written instead, so a gated run is distinguishable from a silent one.
+- `200 { surfaced: false, inserted: 0, reason: "no_qualifying_patterns", candidates, reflections }` — nothing survived the correction, everything surviving was already surfaced, or Claude selected none.
 - `500 { error: "bad_model_output" | "claude_call_failed" | "insert_failed" }`.
 
 **Secrets:** `ANTHROPIC_API_KEY`, `INSIGHTS_CRON_SECRET` (set via `supabase secrets set`).

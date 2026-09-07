@@ -58,5 +58,14 @@ final class SessionStore: ObservableObject {
             errorText = error.localizedDescription
         }
         session = nil
+        // Both of these live in UserDefaults, which outlives the account.
+        // Clearing them means the next person to sign in on this phone is
+        // asked afresh instead of inheriting someone else's HealthKit sync
+        // and someone else's consent to send meals to Claude.
+        // Observers first: they're what would wake the app and sync into
+        // whoever signs in next.
+        HealthKitSync.shared.stopObserving()
+        HealthKitSync.clearConnected()
+        AIDisclosure.shared.reset()
     }
 }

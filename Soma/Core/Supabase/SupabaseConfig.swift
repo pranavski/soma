@@ -5,9 +5,9 @@ import Foundation
 // The anon key is *public* (it only grants what RLS allows), so it's safe
 // to ship in the iOS bundle. The SERVICE ROLE key must NEVER appear here.
 //
-// Local dev defaults below match what `supabase start` prints. Override
-// the values when wiring to a hosted project; the anon key rotates with
-// `supabase secrets`.
+// The values below are the hosted production project (project ref
+// kfrximkdxmdqcbkjqxmb). To point a build at a local stack, swap in what
+// `supabase start` prints; the anon key rotates from the dashboard.
 
 enum SupabaseConfig {
     // Compile-time constant — Swift resolves this at build time. If the

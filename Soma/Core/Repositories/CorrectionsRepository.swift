@@ -33,6 +33,32 @@ struct CorrectionsRepository {
             options: FunctionInvokeOptions(body: body)
         )
     }
+
+    /// The components parse-meal already found for this meal, so the
+    /// correction sheet can start from what's on screen. Without this the
+    /// "what was in it" list opens empty on an already-parsed meal and the
+    /// user has to retype every component to keep it — and a correction
+    /// submitted without retyping archives an empty item list, which is a
+    /// false record of what they ate.
+    ///
+    /// Best-effort: an empty list on failure is the same as today's
+    /// behaviour, so a hiccup here never blocks the correction.
+    func fetchItems(mealId: UUID) async -> [MealCorrection.Item] {
+        struct Row: Decodable { let name: String; let quantity: String? }
+        do {
+            let response = try await client
+                .from("meal_items")
+                .select("name,quantity")
+                .eq("meal_id", value: mealId)
+                .order("position", ascending: true)
+                .limit(12)
+                .execute()
+            let rows = try JSONDecoder().decode([Row].self, from: response.data)
+            return rows.map { MealCorrection.Item(name: $0.name, quantity: $0.quantity) }
+        } catch {
+            return []
+        }
+    }
 }
 
 /// The corrected meal shape sent to the server. Matches the strict
