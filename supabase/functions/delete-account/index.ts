@@ -38,7 +38,9 @@ function empty(status: number): Response {
 // code; we exchange it for a refresh token and revoke that. Best-effort:
 // any failure here must never block the actual deletion.
 //
-// Requires secrets (all four, else silently skipped):
+// Requires secrets — all four, or revocation is skipped (loudly: an
+// incomplete config is an operator mistake, and App Review does test
+// deletion on SIWA apps, so it must not disappear into a silent return):
 //   APPLE_CLIENT_ID    — the app's bundle id (com.pranavsurampudi.soma)
 //   APPLE_TEAM_ID      — 10-char developer team id
 //   APPLE_KEY_ID       — key id of the SIWA .p8 key
@@ -104,7 +106,25 @@ async function revokeAppleToken(authorizationCode: string): Promise<void> {
   const teamId = Deno.env.get("APPLE_TEAM_ID");
   const keyId = Deno.env.get("APPLE_KEY_ID");
   const privateKey = Deno.env.get("APPLE_PRIVATE_KEY");
-  if (!clientId || !teamId || !keyId || !privateKey) return;
+
+  // The guard stays one expression so the four stay narrowed below; the
+  // log names only which secrets are absent, never a value. A partial
+  // config is the dangerous case — it looks configured from the dashboard
+  // and revokes nothing.
+  if (!clientId || !teamId || !keyId || !privateKey) {
+    const missing = [
+      ["APPLE_CLIENT_ID", clientId],
+      ["APPLE_TEAM_ID", teamId],
+      ["APPLE_KEY_ID", keyId],
+      ["APPLE_PRIVATE_KEY", privateKey],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    console.error(
+      `delete-account: Apple token revocation SKIPPED — missing secrets: ${missing.join(", ")}. ` +
+      "The account and its rows are still deleted, but Apple is not told. " +
+      "See docs/deployment-checklist.md §2.",
+    );
+    return;
+  }
 
   const clientSecret = await appleClientSecret(teamId, keyId, clientId, privateKey);
   const form = (params: Record<string, string>) =>
