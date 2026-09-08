@@ -5,25 +5,25 @@ broken has been fixed in code; what remains is hosting, App Store Connect
 and deploy steps that need a human with credentials.
 
 ## Before the next TestFlight build
-- [ ] `supabase db push` — three migrations (insights read-only for clients,
-      `insight_runs`, `ai_consent`), then `supabase migration list` to confirm.
-      Until `ai_consent` is live, the deployed `generate-insights` treats
-      everyone as declined.
-- [ ] `supabase functions deploy generate-insights submit-correction delete-account`
-      (`parse-meal` is deployed separately with menu awareness).
-- [ ] Confirm the four `APPLE_*` secrets are set, or SIWA token revocation
-      silently no-ops during account deletion.
-- [ ] Host `docs/privacy-policy.md` (GitHub Pages), set
-      `SomaFeatures.privacyPolicyURL`, flip `privacyPolicyIsHosted`.
+- [x] `supabase db push` — all 30 migrations applied on the linked project
+      (2026-09-07; `ai_consent` was the only one outstanding).
+- [x] `supabase functions deploy` — parse-meal, submit-correction,
+      delete-account, generate-insights (no JWT) all deployed 2026-09-07.
+- [ ] **Set the four `APPLE_*` secrets** — `supabase secrets list` shows
+      only `ANTHROPIC_API_KEY` and `INSIGHTS_CRON_SECRET`, so SIWA token
+      revocation silently no-ops during account deletion until they exist
+      (docs/deployment-checklist.md §2).
+- [ ] Merge PR #3 → the `pages` workflow publishes
+      https://pranavski.github.io/soma/privacy/ (Pages is enabled with the
+      Actions source; the repo is public). Open it, then flip
+      `SomaFeatures.privacyPolicyIsHosted`.
 - [ ] App Store Connect: privacy URL, support URL, nutrition label, age
       rating, review notes, screenshots — paste from
       docs/app-store-connect-copy.md; status in docs/app-store-compliance.md §6.
-- [ ] Enable GitHub Pages (Settings → Pages → Source: GitHub Actions) so
-      `.github/workflows/pages.yml` publishes the policy. The repo is
-      private: Pages from a private repo needs a paid GitHub plan, else
-      make the repo public or move the policy to a public one.
 - [ ] Seed a reviewer-visible insight with docs/reviewer-seed.sql, record a
       short video, attach it to the submission.
+- [ ] Device smoke test, docs/deployment-checklist.md §8 — especially
+      deletion (step 5) and the consent-decline path (step 7).
 
 ## Nice to have, not blocking
 - [ ] `scripts/build-fdc-reference.ts` has never been run to completion;

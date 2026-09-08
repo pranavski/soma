@@ -3,6 +3,11 @@
 Everything below is what stands between the current repo and a live
 TestFlight/App Store build. Run top to bottom.
 
+> **State on 2026-09-07:** §1 and §3 are done — every migration is applied
+> and all four functions are deployed. §2's `APPLE_*` secrets are **not**
+> set. GitHub Pages is enabled (Actions source); the policy goes live when
+> PR #3 merges to main.
+
 ## 1. Database
 
 ```sh
