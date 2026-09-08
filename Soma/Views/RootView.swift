@@ -64,6 +64,14 @@ struct RootView: View {
             #endif
         }
         .environmentObject(disclosure)
+        // The server-side copy of the answer (ai_consent) is what the
+        // nightly job checks. Re-push it every sign-in so a write that
+        // failed earlier heals, and so accounts that answered before the
+        // row existed get one.
+        .task(id: session.session?.user.id) {
+            guard session.isSignedIn else { return }
+            disclosure.syncToServer()
+        }
         // Named, explicit, before the first send — guideline 5.1.2(i). It
         // rides on `isSignedIn` so it lands right after sign-in and before
         // any meal can be logged, and never appears for a signed-out user.

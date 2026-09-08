@@ -5,16 +5,25 @@ broken has been fixed in code; what remains is hosting, App Store Connect
 and deploy steps that need a human with credentials.
 
 ## Before the next TestFlight build
-- [ ] `supabase db push` — two migrations (insights read-only for clients,
-      `insight_runs`), then `supabase migration list` to confirm.
-- [ ] `supabase functions deploy generate-insights submit-correction delete-account`
-      (`parse-meal` is deployed separately with menu awareness).
-- [ ] Confirm the four `APPLE_*` secrets are set, or SIWA token revocation
-      silently no-ops during account deletion.
-- [ ] Host `docs/privacy-policy.md` (GitHub Pages), set
-      `SomaFeatures.privacyPolicyURL`, flip `privacyPolicyIsHosted`.
+- [x] `supabase db push` — all 30 migrations applied on the linked project
+      (2026-09-07; `ai_consent` was the only one outstanding).
+- [x] `supabase functions deploy` — parse-meal, submit-correction,
+      delete-account, generate-insights (no JWT) all deployed 2026-09-07.
+- [ ] **Set the four `APPLE_*` secrets** — `supabase secrets list` shows
+      only `ANTHROPIC_API_KEY` and `INSIGHTS_CRON_SECRET`, so SIWA token
+      revocation silently no-ops during account deletion until they exist
+      (docs/deployment-checklist.md §2).
+- [ ] Merge PR #3 → the `pages` workflow publishes
+      https://pranavski.github.io/soma/privacy/ (Pages is enabled with the
+      Actions source; the repo is public). Open it, then flip
+      `SomaFeatures.privacyPolicyIsHosted`.
 - [ ] App Store Connect: privacy URL, support URL, nutrition label, age
-      rating, review notes, screenshots — docs/app-store-compliance.md §6.
+      rating, review notes, screenshots — paste from
+      docs/app-store-connect-copy.md; status in docs/app-store-compliance.md §6.
+- [ ] Seed a reviewer-visible insight with docs/reviewer-seed.sql, record a
+      short video, attach it to the submission.
+- [ ] Device smoke test, docs/deployment-checklist.md §8 — especially
+      deletion (step 5) and the consent-decline path (step 7).
 
 ## Nice to have, not blocking
 - [ ] `scripts/build-fdc-reference.ts` has never been run to completion;
@@ -27,6 +36,7 @@ and deploy steps that need a human with credentials.
 - [ ] Meal plans — design note only (docs/meal-plans-design.md), no code.
 
 ## Done (kept for the record)
+- AI consent enforced server-side (`ai_consent`), not just on the phone.
 - Voice / typed meal → pending row → Claude parse → Today card.
 - Declined AI consent files the meal as written, correction open.
 - Corrections rewrite meal_items; corrected rows repeatable and re-correctable.

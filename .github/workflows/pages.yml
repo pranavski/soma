@@ -1,0 +1,57 @@
+# Publishes the privacy policy (and a one-page support index) to GitHub
+# Pages. Only these two documents are published — the rest of docs/ stays
+# in the repo.
+#
+# One-time setup: repo Settings → Pages → Build and deployment → Source:
+# "GitHub Actions". Then the URL is https://<owner>.github.io/soma/privacy/
+# — put that in App Store Connect and in SomaFeatures.privacyPolicyURL,
+# and flip privacyPolicyIsHosted once you have opened it in a browser.
+#
+# Note: Pages from a *private* repository requires a paid GitHub plan.
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/privacy-policy.md
+      - site/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render
+        run: |
+          mkdir -p _site/privacy
+          pandoc docs/privacy-policy.md -s --metadata title="Soma Privacy Policy" \
+            -c ../style.css -o _site/privacy/index.html
+          pandoc site/index.md -s --metadata title="Soma" \
+            -c style.css -o _site/index.html
+          cp site/style.css _site/style.css
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

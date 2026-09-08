@@ -1,6 +1,6 @@
 # Soma Privacy Policy
 
-_Last updated: August 2, 2026_
+_Last updated: September 7, 2026_
 
 Soma is a food–body record. You log meals in about ten seconds, optionally
 connect Apple Health, and Soma looks for honest, hedged correlations in your
@@ -71,8 +71,10 @@ your daily summary and used only by the insight engine.
 
 ## Third-party AI: Anthropic's Claude
 
-Soma sends data to **Anthropic's Claude** for three purposes, and only after
-you have explicitly agreed in the app. Soma asks once, before your first
+Soma sends data to **Anthropic's Claude** for two purposes, and only after
+you have explicitly agreed in the app. Your answer is stored with your
+account as well as on your phone, so the nightly look-back described below
+never runs for someone who has declined. Soma asks once, before your first
 meal is parsed, and you can withdraw consent at any time in
 **the kitchen → Reading meals**.
 
