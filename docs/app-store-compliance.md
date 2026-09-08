@@ -414,16 +414,16 @@ user's language; never overstate.
 2. **5.1.1(v) non-functional account deletion.** If the four `APPLE_*`
    secrets are unset, token revocation silently no-ops and a second sign-in
    comes back without name/email. Set them and run smoke-test step 5.
-3. **5.1.1(i) privacy policy URL.** `SomaFeatures.privacyPolicyURL` points
-   at a domain we do not own until GitHub Pages is live. Ship with the flag
-   false if hosting slips — the in-app sheet carries the full text — but the
-   ASC field itself is mandatory and must resolve.
+3. ~~**5.1.1(i) privacy policy URL.**~~ Closed 2026-09-08: the policy is
+   live on GitHub Pages, the flag is flipped, and the URL still has to go
+   in the App Store Connect metadata field.
 4. **1.4.1 medical framing in metadata.** The app is clean; the description,
    subtitle and screenshots are what could still attract it. §1 lists the
    banned phrases.
-5. **Backend not deployed.** Two migrations and four functions are pending.
-   An undeployed `generate-insights` turns pull-to-refresh into an error in
-   the reviewer's hands.
+5. ~~**Backend not deployed.**~~ Closed 2026-09-08: 30/30 migrations
+   applied and all four functions deployed to `kfrximkdxmdqcbkjqxmb`. An
+   unauthenticated call to `generate-insights` answers 401, so the deploy
+   is live. Redeploy after any change to `supabase/`.
 
 Closed since the 2026-08-02 ranking: in-app AI consent (now also enforced
 server-side), policy accuracy, in-app policy link, medical-advice line,
@@ -471,14 +471,17 @@ new required-reason API it adopts lands on the app manifest.
 
 ### Still open — not closeable in code
 
-- [ ] **LEGAL** — Host `docs/privacy-policy.md` (GitHub Pages), point
-  `SomaFeatures.privacyPolicyURL` at it and set `privacyPolicyIsHosted`
-  to true. Until then the in-app web link is hidden and the sheet carries
-  the full text
+- [x] **LEGAL** — Policy hosted at https://pranavski.github.io/soma/privacy/
+  (GitHub Pages, published from `docs/privacy-policy.md` by
+  `.github/workflows/pages.yml`). `privacyPolicyIsHosted` is true, so the
+  sheet now shows the web link alongside the full text (2026-09-08)
 - [ ] **ASC** — Privacy Policy URL + Support URL in App Store Connect;
   support contact is `SomaFeatures.supportEmail`
-- [ ] **ASC** — Set the four `APPLE_*` secrets in Supabase or SIWA token
-  revocation silently no-ops during deletion (see deployment checklist §2)
+- [ ] **ASC** — Two of the four `APPLE_*` secrets are set (client id, team
+  id, 2026-09-08). `APPLE_KEY_ID` and `APPLE_PRIVATE_KEY` need a `.p8`
+  created at developer.apple.com; until they exist deletion completes but
+  Apple is never told. No longer silent: `delete-account` logs the missing
+  names (deployment checklist §2)
 - [ ] **ASC** — Nutrition label per §2. "Photos or Videos" is **not**
   declared; there is no photo path in the app
 - [ ] **ASC** — Age-rating questionnaire; Review Notes stating Soma is a

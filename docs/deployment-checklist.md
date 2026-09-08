@@ -3,10 +3,13 @@
 Everything below is what stands between the current repo and a live
 TestFlight/App Store build. Run top to bottom.
 
-> **State on 2026-09-07:** §1 and §3 are done — every migration is applied
-> and all four functions are deployed. §2's `APPLE_*` secrets are **not**
-> set. GitHub Pages is enabled (Actions source); the policy goes live when
-> PR #3 merges to main.
+> **State on 2026-09-08.** Done: every migration applied (30/30), all four
+> functions deployed, GitHub Pages live at
+> https://pranavski.github.io/soma/privacy/, `privacyPolicyIsHosted` true.
+> Outstanding: `APPLE_KEY_ID` and `APPLE_PRIVATE_KEY` (§2) — the other two
+> Apple secrets are set, so revocation is *half* configured and does
+> nothing; `delete-account` logs which are missing. Then §6 (App Store
+> Connect) and §8 (device smoke test).
 
 ## 1. Database
 
@@ -35,8 +38,10 @@ supabase secrets set INSIGHTS_CRON_SECRET=$(openssl rand -hex 32)
 
 # SIWA token revocation (delete-account). All four required or the
 # function silently skips revocation:
-supabase secrets set APPLE_CLIENT_ID=com.pranavsurampudi.soma
-supabase secrets set APPLE_TEAM_ID=<10-char team id>
+# Set 2026-09-08:
+#   supabase secrets set APPLE_CLIENT_ID=com.pranavsurampudi.soma
+#   supabase secrets set APPLE_TEAM_ID=8VZH2497GC
+# Still needed — the .p8 does not exist until you create it:
 supabase secrets set APPLE_KEY_ID=<key id of the .p8 SIWA key>
 supabase secrets set APPLE_PRIVATE_KEY="$(cat AuthKey_XXXXXXXXXX.p8)"
 ```

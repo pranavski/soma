@@ -5,19 +5,20 @@ broken has been fixed in code; what remains is hosting, App Store Connect
 and deploy steps that need a human with credentials.
 
 ## Before the next TestFlight build
-- [x] `supabase db push` — all 30 migrations applied on the linked project
-      (2026-09-07; `ai_consent` was the only one outstanding).
-- [x] `supabase functions deploy` — parse-meal, submit-correction,
-      delete-account, generate-insights (no JWT) all deployed 2026-09-07.
-- [ ] **Set the four `APPLE_*` secrets** — `supabase secrets list` shows
-      only `ANTHROPIC_API_KEY` and `INSIGHTS_CRON_SECRET`, so SIWA token
-      revocation silently no-ops during account deletion until they exist
-      (docs/deployment-checklist.md §2).
-- [ ] Merge PR #3 → the `pages` workflow publishes
-      https://pranavski.github.io/soma/privacy/ (Pages is enabled with the
-      Actions source; the repo is public). Open it, then flip
-      `SomaFeatures.privacyPolicyIsHosted`.
-- [ ] App Store Connect: privacy URL, support URL, nutrition label, age
+
+Done 2026-09-08: PR #3 merged to main; all 30 migrations applied; all four
+Edge Functions deployed; GitHub Pages live; `privacyPolicyIsHosted` flipped.
+
+- [ ] **Create the Sign in with Apple key and set the last two secrets.**
+      `APPLE_CLIENT_ID` and `APPLE_TEAM_ID` (8VZH2497GC) are set;
+      `APPLE_KEY_ID` and `APPLE_PRIVATE_KEY` are not, because the `.p8`
+      only exists once a human makes it at developer.apple.com →
+      Certificates → Keys → new key with "Sign in with Apple" enabled for
+      the Soma App ID. Until then deletion works but Apple is never told —
+      `delete-account` now logs exactly that, so check the function logs
+      after the first test deletion.
+- [ ] App Store Connect: privacy URL (https://pranavski.github.io/soma/privacy/),
+      support URL (https://pranavski.github.io/soma/), nutrition label, age
       rating, review notes, screenshots — paste from
       docs/app-store-connect-copy.md; status in docs/app-store-compliance.md §6.
 - [ ] Seed a reviewer-visible insight with docs/reviewer-seed.sql, record a
